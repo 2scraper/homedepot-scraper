@@ -1,0 +1,123 @@
+name: canary
+
+# ONE real run a day against a known-good leaf category, to catch the site
+# changing its markup before a user does.
+#
+# It requests THREE pages on purpose. With one page pagination is never
+# exercised, and that is exactly how a silent single-page bug survived in a
+# sibling repo: `--pages 3` fetched one page and exited 0, a complete-looking
+# success holding a third of the data.
+#
+# A GitHub runner is a datacentre address, and this edge refuses those. So the
+# live steps are guarded on the proxy secret and the job goes GREEN with a
+# ::notice:: when it is absent. A check that is always red teaches everyone to
+# ignore checks.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-22.04   # NOT ubuntu-latest: playwright's --with-deps
+                            # apt step dies on 24.04.
+    env:
+      # `secrets` is not available in a job-level `if`, so presence is tested
+      # through job env and read in each step's `if`.
+      HAS_PROXY: ${{ secrets.HOMEDEPOT_PROXY != '' }}
+      HAS_CDP: ${{ secrets.HOMEDEPOT_CDP_ENDPOINT != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Explain the skip
+        if: env.HAS_PROXY != 'true' && env.HAS_CDP != 'true'
+        run: |
+          echo "::notice::Skipped: no HOMEDEPOT_PROXY or HOMEDEPOT_CDP_ENDPOINT."
+          echo "::notice::Measured 2026-09-22, www.homedepot.com answers HTTP 403"
+          echo "::notice::to a non-US address, and a GitHub runner is a datacentre"
+          echo "::notice::address. A live run from here without an exit would be"
+          echo "::notice::red every day regardless of the code."
+
+      - name: Install
+        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-playwright.txt
+          playwright install --with-deps chromium
+
+      - name: Live run
+        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
+        # The credential goes through the ENVIRONMENT, never a --proxy flag on
+        # the command line: env_config.py already reads exactly these names, an
+        # unset secret arrives as an empty string which the loader treats as
+        # unset, and argv is readable by `ps` and lands in CI logs.
+        env:
+          HOMEDEPOT_PROXY: ${{ secrets.HOMEDEPOT_PROXY }}
+          HOMEDEPOT_CDP_ENDPOINT: ${{ secrets.HOMEDEPOT_CDP_ENDPOINT }}
+          TWOCAPTCHA_KEY: ${{ secrets.TWOCAPTCHA_KEY }}
+        run: |
+          # GitHub runs `run:` under `bash -e`, so a non-zero command aborts
+          # the step BEFORE a following `echo "rc=$?"`. `continue-on-error`
+          # does not change that — it stops the step failing the job, not the
+          # shell's errexit.
+          set +e
+          python3 playwright_scraper.py \
+            --url https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7 \
+            --pages 3 --out canary --format both --verbose
+          echo "rc=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Assert the data, not just the exit code
+        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          rc = os.environ.get("rc", "?")
+          meta = json.load(open("canary.meta.json"))
+          rows = json.load(open("canary.json"))
+          fails = []
+          if meta["status"] != "complete":
+              fails.append("status=%s" % meta["status"])
+          if meta["pages_completed"] < 3:
+              fails.append("pages_completed=%s (pagination not exercised)"
+                           % meta["pages_completed"])
+          # Thresholds from the 2026-09-22 baseline: 35 rows over 3 pages,
+          # 35/35 on price, currency, brand and sku.
+          if len(rows) < 30:
+              fails.append("rows=%d (baseline 35)" % len(rows))
+          priced = sum(1 for r in rows if r["price"] is not None)
+          if priced < 0.95 * len(rows):
+              fails.append("price coverage %d/%d" % (priced, len(rows)))
+          if {r["currency"] for r in rows} - {"USD"}:
+              fails.append("unexpected currency")
+          if any(r["sku"] is None for r in rows):
+              fails.append("a row has no sku")
+          # One line, and it catches the strike-price regression forever.
+          bad = [r for r in rows if r["original_price"] is not None
+                 and r["price"] is not None and r["original_price"] <= r["price"]]
+          if bad:
+              fails.append("%d row(s) with original_price <= price" % len(bad))
+          if not {r["store_id"] for r in rows} - {None}:
+              fails.append("no store recorded — a price without its store is not a fact")
+          print("exit code from the run: %s" % rc)
+          print("store:", {(r["store_id"], r["store_name"]) for r in rows})
+          if fails:
+              print("::error::canary failed: %s" % "; ".join(fails))
+              sys.exit(1)
+          print("canary OK: %d rows, %d priced" % (len(rows), priced))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: canary-output
+          path: |
+            canary.json
+            canary.csv
+            canary*.meta.json
+          if-no-files-found: ignore

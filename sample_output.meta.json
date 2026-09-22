@@ -1,0 +1,49 @@
+{
+  "source": "homedepot.com",
+  "mode": "category",
+  "status": "complete",
+  "stop_reason": "completed",
+  "pages_requested": 3,
+  "pages_completed": 3,
+  "pages_failed": [],
+  "products": 35,
+  "scope": {
+    "store_id": null,
+    "locale": null,
+    "category": null,
+    "grids": {
+      "count": 0,
+      "digest": null
+    },
+    "max_grids": null,
+    "max_products": null,
+    "schema_version": "004c811f51c0"
+  },
+  "start_url": "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7",
+  "final_url": "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7?Nao=24",
+  "finished_at": "2026-09-22T11:56:26.956508+00:00",
+  "run_id": "e7e019321942",
+  "blocked": false,
+  "transport_facts": {
+    "transport": "http",
+    "exit": "http://***:***@na.proxy.2captcha.com:2334 (session-vjZA2Ler4)",
+    "pages_requested": 3,
+    "pages_completed": 3,
+    "failed_pages": [],
+    "states": [
+      "content",
+      "content",
+      "content"
+    ],
+    "store_id": "121",
+    "store_name": "Cumberland",
+    "total_products_reported": 144,
+    "blocked": false,
+    "rotations": 0,
+    "start_url": "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7",
+    "final_url": "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7?Nao=24",
+    "store_postal_code": "30339",
+    "page_size": 12
+  },
+  "data_updated": true
+}

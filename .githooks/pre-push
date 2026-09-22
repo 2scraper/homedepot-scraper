@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Scans the commits about to be pushed, not just the working tree.
+#
+# pre-commit only sees what it was installed for. This catches anything that
+# was committed before the hook existed, or with --no-verify, and it is the
+# last point at which a secret is still private.
+remote_sha_zero=0000000000000000000000000000000000000000
+root="$(git rev-parse --show-toplevel)"
+status=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$remote_sha_zero" ] && continue          # deleting a ref
+  if [ "$remote_sha" = "$remote_sha_zero" ]; then
+    range="$local_sha"                                        # new branch
+    revs="$(git rev-list "$local_sha" --not --remotes | head -200)"
+    [ -z "$revs" ] && continue
+    python3 "$root/tools/scan_secrets.py" --range "$local_sha --not --remotes" || status=1
+  else
+    python3 "$root/tools/scan_secrets.py" --range "$remote_sha..$local_sha" || status=1
+  fi
+done
+exit $status

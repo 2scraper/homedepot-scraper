@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homedepot-scraper"
+version = "1.0.0"
+description = "homedepot.com listing and product scraper (Playwright, Selenium, Puppeteer or plain HTTP) — Apollo-state and JSON-LD parsing, proxies, fingerprints, captcha solving"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "2scraper" }]
+keywords = ["homedepot", "ecommerce", "web-scraping", "scraper",
+            "price-monitoring", "playwright", "selenium", "puppeteer",
+            "captcha-solver", "scraping-browser", "proxy", "fingerprints"]
+# NOTE no "License :: OSI Approved :: …" classifier. PEP 639 supersedes those
+# with the `license` expression above, and modern setuptools REFUSES a build
+# that carries both — which is how the wheel step failed in CI on the first
+# run in a fresh repository.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+dependencies = ["beautifulsoup4>=4.12", "requests>=2.31"]
+
+[project.urls]
+Homepage = "https://2captcha.com"
+Repository = "https://github.com/2scraper/homedepot-scraper"
+Changelog = "https://github.com/2scraper/homedepot-scraper/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+playwright = ["playwright>=1.44"]
+selenium = ["selenium>=4.20"]
+puppeteer = ["pyppeteer>=1.0.2"]
+
+[project.scripts]
+homedepot-scraper = "playwright_scraper:main"
+homedepot-scraper-http = "http_scraper:main"
+homedepot-catalog = "catalog_walk:main"
+
+# A flat collection of top-level scripts, so setuptools is told explicitly
+# rather than asked to guess among this many modules.
+[tool.setuptools]
+py-modules = [
+    "browser_bridge", "captcha_solver", "catalog_walk", "diff_runs",
+    "env_config", "fingerprint_client", "http_scraper", "output_writer",
+    "page_flow", "playwright_scraper", "product_parser", "proxy_pool",
+    "puppeteer_scraper", "scraper_api_client", "selenium_scraper",
+]

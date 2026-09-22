@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Blocks a commit that stages anything credential-shaped.
+#
+# This is the guard that would have stopped the 2026-09-22 incident. The
+# checks that existed then ran in CI — by which point the objects were already
+# on a public server, and deleting the branch afterwards does not remove them.
+# A ref is a pointer; the blob stays and GitHub serves it by SHA.
+#
+# Install:  tools/install_hooks.sh
+# Bypass:   git commit --no-verify   (you had better be sure)
+exec python3 "$(git rev-parse --show-toplevel)/tools/scan_secrets.py" --staged
