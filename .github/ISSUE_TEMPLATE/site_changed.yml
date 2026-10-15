@@ -9,15 +9,15 @@ body:
         own report because the fix is different from a code bug: something on
         homedepot.com moved.
 
-        Useful to know before filing: **this repo does not parse HTML at all.**
-        A rendered listing page carries no products — 0 JSON-LD blocks, 0
-        product ids, 0 grid classes. Everything comes from JSON under
-        `/itxrest/`, so "the markup changed" is almost never the diagnosis.
+        Useful to know before filing: **a listing page carries no product
+        tiles in its markup.** Its products come from the page's own
+        `window.__APOLLO_STATE__`; a product page's come from its `Product`
+        JSON-LD block. So "the markup changed" is rarely the diagnosis.
 
-        Three things can move: the endpoint paths themselves, the payload
-        shape (`bundleProductSummaries[].detail.colors[].sizes[]`), or the
-        menu that grids are reached through. Saying which narrows the fix a
-        lot, and pasting the payload fragment beats describing it.
+        Three things can move: whether the page still embeds that state or
+        JSON-LD, the `SearchModel` and `base-searchNav-<itemId>` nodes inside
+        the state, or the fields on a product node. Saying which narrows the
+        fix a lot, and pasting the fragment beats describing it.
 
   - type: dropdown
     id: mode
@@ -35,12 +35,11 @@ body:
     attributes:
       label: What stopped matching
       options:
-        - Rows (0 rows from a category that has products)
-        - A specific field is null or wrong (price, size, colour, availability, ...)
-        - A colour or size tree is not expanded (one row per product, not per SKU)
-        - An endpoint answers 404 or a shape the parser does not recognise
-        - Every request is refused with a 195-byte 403 (that is the EXIT, not the site)
-        - The menu no longer lists the grid you expected
+        - Rows (0 rows from a leaf category that has products)
+        - A specific field is null or wrong (price, availability, store, stock, ...)
+        - The page parsed to 0 rows although it lists products (a parser failure)
+        - Every request is refused with a ~370-byte 403 (that is the EXIT, not the site)
+        - The interstitial no longer clears in a browser
         - Something else
     validations:
       required: true
@@ -50,7 +49,7 @@ body:
     attributes:
       label: URL
       description: The exact page URL you ran against.
-      placeholder: "https://www.homedepot.com/gb/women.html"
+      placeholder: "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7"
     validations:
       required: true
 
@@ -61,14 +60,13 @@ body:
       description: |
         Whichever of these you can get. A capture beats a description.
 
-        - The JSON fragment for ONE product, from
-          `/itxrest/3/catalog/store/{store}/{catalog}/productsArray?productIds={id}`.
-          Trim it, but keep the `bundleProductSummaries` nesting intact — that
-          nesting IS the thing that usually broke.
-        - For a field problem: the value you got, and the value in the payload.
-        - For a refusal: the response headers. `x-reference-error` plus
-          `akamai-cache-status: Error from child` means your exit address was
-          refused before the site saw the request, which is not a parser bug.
+        - The `base-searchNav-<itemId>` node for ONE product from the
+          listing's `__APOLLO_STATE__` (`--dump-html` saves the page), or the
+          `Product` JSON-LD block from a product page.
+        - For a field problem: the value you got, and the value in the page.
+        - For a refusal: the status and size the run logged. Akamai's 403 is
+          a few hundred bytes and names your exit address's refusal, not a
+          parser bug.
       render: text
     validations:
       required: true

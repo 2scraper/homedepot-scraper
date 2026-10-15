@@ -21,11 +21,12 @@ from __future__ import annotations
 import sys
 
 import browser_bridge
+import captcha_solver
 import proxy_pool
 
 # Imported at MODULE level on purpose: the offline suite must be able to skip
 # this engine when Playwright is absent, and it can only tell that if the
-# import fails here rather than deep inside start() (CLAUDE.md §10).
+# import fails here rather than deep inside start().
 from playwright.sync_api import sync_playwright
 
 
@@ -49,7 +50,7 @@ class PlaywrightDriver:
         if self.args.cdp_endpoint:
             # Wrapped so a failure cannot print the endpoint, which carries a
             # password. Playwright repeats it five times in one error — the
-            # message plus a four-line call log (CLAUDE.md §8).
+            # message plus a four-line call log.
             try:
                 self._browser = self._pw.chromium.connect_over_cdp(
                     self.args.cdp_endpoint, timeout=self.args.timeout * 1000)
@@ -74,7 +75,7 @@ class PlaywrightDriver:
             # remote browser brings its own and stacking a second is a
             # contradiction; locally, a hardcoded UA drifts from whatever
             # Chromium is installed and claiming an older Chrome than the JS
-            # engine reports is itself a mismatch (CLAUDE.md §8).
+            # engine reports is itself a mismatch.
             self._context = self._browser.new_context(locale="en-US")
         self._page = self._context.new_page()
         self._page.set_default_timeout(self.args.timeout * 1000)
@@ -154,6 +155,14 @@ class PlaywrightDriver:
             return node.get_attribute(name)
         except Exception:
             return None
+
+    # The paid captcha rung's two page operations. Playwright evaluates an
+    # arrow function directly, which is the dialect captcha_solver's JS is in.
+    def recaptcha_discovery(self):
+        return self._page.evaluate(captcha_solver.RECAPTCHA_DISCOVERY_JS)
+
+    def inject_captcha_token(self, token):
+        return bool(self._page.evaluate(captcha_solver.INJECT_TOKEN_JS, token))
 
     def sleep(self, ms):
         self._page.wait_for_timeout(ms)

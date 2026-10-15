@@ -140,9 +140,9 @@ def sample_check(prefix="sample_output"):
 
     `prefix` exists so the canary workflow can point this at the output of a
     real run instead of carrying its own copy of these assertions inline.
-    That is CLAUDE.md §11: a workflow step calls the shipped check. The
-    sibling repo's first push went red because `tests.yml` had re-implemented
-    a check instead, and the copy drifted.
+    A workflow step calls the shipped check rather than re-implementing it:
+    an inline copy in a workflow drifts from the real one, and nothing local
+    ever runs it.
     """
     failed = []
     names = (f"{prefix}.json", f"{prefix}.csv")
@@ -163,8 +163,7 @@ def sample_check(prefix="sample_output"):
 
     # The committed sample doubles as a schema test: rename a field in the code
     # and forget the sample, and this fails rather than the docs going stale.
-    # It is a --mode category sample from a PRICED locale, so it exercises
-    # every column a showcase-locale run would leave null.
+    # It is a --mode category sample cut from a real run.
     sys.path.insert(0, str(REPO))
     from dataclasses import asdict
 
@@ -214,7 +213,7 @@ def secret_check():
     import subprocess
     result = subprocess.run(
         [sys.executable, str(REPO / "tools" / "scan_secrets.py"), "--worktree"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, cwd=str(REPO))
     if result.returncode == 0:
         print("ok       tools/scan_secrets.py --worktree: clean")
         return []
@@ -230,9 +229,8 @@ def run_check(prefix="sample_output"):
     sidecar, the row floor, and the two things a silently-degraded run gets
     wrong while still writing a well-formed file.
 
-    Kept here rather than inline in canary.yml because CLAUDE.md §11 is
-    explicit about it, and because a floor that lives in YAML is a floor
-    nobody runs locally before pushing.
+    Kept here rather than inline in canary.yml because a floor that lives in
+    YAML is a floor nobody runs locally before pushing.
     """
     failed = []
     meta_path = REPO / f"{prefix}.meta.json"
@@ -245,13 +243,20 @@ def run_check(prefix="sample_output"):
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     rows = json.loads(rows_path.read_text(encoding="utf-8"))
 
-    # Set below every live figure measured on 2026-09-19/20 (131 rows from
-    # one category, 1,907 from three) so a merchandising change does not flap
-    # the canary, while a parser that stopped expanding bundles does trip it.
-    # A row is a SKU, and the smallest category measured still held dozens.
+    # A floor on the PARSER, not on the catalogue: the canary asks for three
+    # pages of 12 from a category that held 144 products when it was chosen
+    # (35 rows on 2026-09-22). 20 is far enough below that for the category's
+    # own churn, and far above what a parser that lost the grid returns.
     MIN_ROWS = 20
     if len(rows) < MIN_ROWS:
         failed.append(f"only {len(rows)} rows, expected at least {MIN_ROWS}")
+
+    # Pagination has to have been exercised, or a run that silently fetched
+    # one page reads as complete.
+    if (meta.get("pages_requested") or 0) >= 3 and \
+            (meta.get("pages_completed") or 0) < 3:
+        failed.append(f"pages_completed={meta.get('pages_completed')} of "
+                      f"{meta.get('pages_requested')} — pagination not exercised")
 
     if meta.get("status") != "complete":
         failed.append(f"run status is {meta.get('status')!r}, not 'complete'")
@@ -262,8 +267,8 @@ def run_check(prefix="sample_output"):
         failed.append(f"run source is {meta.get('source')!r}, not "
                       f"{SOURCE_DEFAULT!r}")
 
-    # Every row is one SKU. Duplicates mean the bundle fold stopped working,
-    # which is invisible in a row count and in every per-column check.
+    # Every row is one itemId. Duplicates mean the per-run dedupe stopped
+    # working, which is invisible in a row count and in every column check.
     skus = [r.get("sku") for r in rows]
     if len(set(skus)) != len(skus):
         failed.append(f"{len(skus) - len(set(skus))} duplicate sku(s) in the "
@@ -278,8 +283,18 @@ def run_check(prefix="sample_output"):
     #               is not a fact.
     #   hierarchy — the only trustworthy taxonomy; the URL slug cannot be
     #               split back into levels.
-    if not any(r.get("price") is not None for r in rows):
-        failed.append("no row carries a price")
+    # Core fields are checked on every row (identity) or as a share (price),
+    # never as a merchandising share such as "how many are discounted".
+    for field in ("sku", "title", "url"):
+        missing = sum(1 for r in rows if not r.get(field))
+        if missing:
+            failed.append(f"{missing} row(s) have no {field}")
+    priced = sum(1 for r in rows if r.get("price") is not None)
+    if rows and priced < 0.9 * len(rows):
+        failed.append(f"only {priced}/{len(rows)} rows carry a price")
+    currencies = {r.get("currency") for r in rows if r.get("price") is not None}
+    if currencies - {"USD"}:
+        failed.append(f"unexpected currency {sorted(map(str, currencies))}")
     if not any(r.get("store_id") for r in rows):
         failed.append("no row names the store its price belongs to")
     if not any(r.get("category_hierarchy") for r in rows):

@@ -78,16 +78,14 @@ jobs:
             code, or a comment that explains a reason the code no longer has.
 
             A few things specific to this repo worth checking: every price is
-            in EUR and every row is a DOM reading (there is no JSON-LD on
-            this site to cross-check against — see output_writer.py and
-            diff_runs.py); there are two row schemas, Player and Transfer
-            (output_writer.py), and a change to one should not silently affect
-            the other; `page` and `row_index` must stay unique across a
-            paginated run (see product_parser.py and the tokopedia lesson in
-            CLAUDE.md); and this site's listing pagination is robots-DISALLOWED,
-            so product_parser.page_url() returning its input unchanged is a
-            deliberate decision, not a stub — a change that makes it
-            construct a URL deserves extra scrutiny.
+            in USD and belongs to a STORE (rows carry store_id, and
+            diff_runs.py refuses to compare two stores); a listing row is read
+            from the page's __APOLLO_STATE__ and a product row from its
+            Product JSON-LD, which is what price_source records; `page` and
+            `row_index` must stay unique across a paginated run; and listing
+            pagination is the site's own `?Nao=<offset>`, built by
+            product_parser.page_url(), with the run stopping on a page that
+            adds no new sku rather than on totalProducts.
 
             Also worth flagging: a check that cannot fail, an error path that
             swallows a failure silently, a credential that could reach a

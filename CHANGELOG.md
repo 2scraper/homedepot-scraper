@@ -10,6 +10,79 @@ is frozen: where a default changes because the old one was wrong or expensive,
 that is called out at the top of the release notes rather than treated as a
 violation.
 
+## [Unreleased]
+
+> **Behaviour changes.** Exit codes: a run whose content was never obtained —
+> no answer from the site over plain HTTP, an empty document from a browser
+> navigation, a page that lists products but parsed to none — now exits **5**
+> (it was 3, or 4). A transport fault AFTER some pages gave rows now writes
+> those rows and exits **6** (the browser engines used to discard them and
+> exit 5). A URL that is not a homedepot.com host, or no URL at all, now exits
+> **2** (it was 1). Output files now take their mode from the umask, or keep
+> an existing file's mode, instead of always being **0600**. CSV cells that a
+> spreadsheet would execute now start with `'`. The canary now FAILS when no
+> exit secret is set, instead of skipping green.
+
+### Fixed
+
+- **The paid captcha rung could not run.** `browser_bridge` called a solver
+  function that does not exist and swallowed the error, so a detected
+  reCAPTCHA was never solved. It now reconciles the page's static and live
+  detections, buys at most ONE solve per page (an allowance checked before
+  the purchase and never reset), and buys only what it can use: the engine
+  must be able to inject the token, and reCAPTCHA Enterprise — not
+  implemented here — is never paid for. No widget has been seen on this site;
+  this is the path for when one appears.
+- **`http_scraper.py` reported a dead connection or proxy as blocked (exit
+  3).** It now reports exit 5, or 6 after earlier rows. A refused proxy
+  credential on page N keeps the rows from pages before it.
+- **`http_scraper.py` asked a refusing exit the same question again** when
+  there was no other exit to move to. A 403 or the interstitial without a
+  pool now ends that page after one request.
+- **The browser engines lost rows on a transport fault** after page 1, and
+  wrote no `.latest_attempt.meta.json`. Both are written now. An unexpected
+  exception in our own code is a crash (exit 1), not a "remote error".
+- **An empty document** (a navigation that produced nothing) has its own
+  message and exit 5, instead of reading as Akamai's refusal.
+- **A served listing that parses to zero rows** is reported as a parser
+  failure (`stop_reason: parser_found_nothing`), not as an empty category.
+- **`finish_run` mapped any unknown reason with zero rows to "empty
+  catalogue".** Only a complete run, a hub or an empty listing is exit 4 now.
+- **A typed `--category-url` lost to `HOMEDEPOT_URL` in `.env`.** What you
+  type wins.
+- **Outputs were always 0600.** New files follow the umask; an existing file
+  keeps its mode.
+- **CSV formula cells.** Strings beginning `=`, `+`, `-`, `@`, tab, CR or LF
+  get a leading apostrophe in the CSV only, after list cells are joined;
+  numbers and the JSON are untouched. The sidecar records
+  `csv_cells_escaped`.
+- **`scraper_api_client.py` crashed on the API's response**: it read the
+  target status from `status`, which is the API's verdict string. It now
+  reads `http_code`, masks the `x-debug` header before logging it, keeps
+  earlier rows when a later call fails, and validates `--pages`, `--delay`
+  and `--timeout`.
+- **`diff_runs.py` tracked columns this repo does not have** and missed
+  `store_quantity` and `local_delivery_quantity`. It now tracks this repo's
+  own columns and refuses to compare runs that priced different stores; every
+  run records its `scope.store_id`.
+- **The secret scan read tracked files only.** It now also reads untracked
+  files that are not ignored, skips virtualenvs by their `pyvenv.cfg`, and
+  says how many files it read.
+- **`--dump-html` files were not ignored** (`x_p1.html`); they are now.
+- **The README listed `--fingerprint` for two browser engines** that have no
+  such flag. The row is gone.
+- Contributor docs, issue templates, ignore files, `page_flow.py` and
+  `output_writer.py` described another site's catalogue; they describe Home
+  Depot's now. Unused policy helpers in `page_flow.py` were removed.
+
+### Changed
+
+- **The canary runs the engine that can work from a runner, and fails when it
+  cannot.** With `HOMEDEPOT_PROXY` it runs `http_scraper.py`; with
+  `HOMEDEPOT_CDP_ENDPOINT`, Playwright over CDP; with neither, it fails and
+  names both. Exit 3, 4, 5 or 6 fails it, and the row floor, core fields and
+  pagination are asserted by `ci_checks.py --run-check`.
+
 ## [1.0.0] — 2026-09-23
 
 First release. Every number below was measured against the live site, not

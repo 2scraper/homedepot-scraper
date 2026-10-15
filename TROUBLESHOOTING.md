@@ -222,10 +222,14 @@ python3 -m venv .venv-playwright
 
 ## The canary is red
 
-Interpret the exit code in the log before assuming the site changed. A GitHub
-runner is a datacentre address, which this edge refuses, so the canary is
-guarded on the proxy secret and goes green with a `::notice::` when it is
-absent. A red canary from a bare runner is usually the address, not the markup.
+Read the `::error::` line first. A GitHub runner is a datacentre address,
+which this edge refuses, so the canary needs `HOMEDEPOT_PROXY` (a US
+residential proxy; it runs `http_scraper.py`) or `HOMEDEPOT_CDP_ENDPOINT` (a
+`country-us` Scraping Browser endpoint; it runs `playwright_scraper.py`). With
+neither secret it fails and names them — it does not go green without having
+reached the site. Exit 3 means the secret's address is refused, exit 5 that
+the site was never reached or a served page parsed to nothing, and a failed
+row/field check after exit 0 is the markup.
 
 ---
 

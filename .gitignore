@@ -7,7 +7,7 @@
 *.json
 *.csv
 !package.json
-# Committed on purpose: a real excerpt of a real run (--mode market-values),
+# Committed on purpose: a real excerpt of a real run (--mode category),
 # so a reader can see the exact output shape without installing anything.
 !sample_output.json
 # The sample's run-metadata sidecar travels with it. `.github/ci_checks.py
@@ -16,7 +16,6 @@
 !sample_output.meta.json
 !sample_output.csv
 homedepot_products.*
-bershka_products_*.*
 # The canary workflow's own run, and anyone reproducing it locally.
 canary_run.*
 
@@ -26,12 +25,11 @@ canary_run.*
 *_debug.html
 *_debug.png
 *.html.page*
-
-# --- unlike other members of this family, index.html and landing.md are ----
-# --- committed here on purpose, not generated -- do NOT gitignore them -----
-# (kept as an explicit note rather than a silent omission, since every sibling
-# scraper in this family DOES gitignore an index.html as "published
-# elsewhere", and that is deliberately not true of this repo)
+# --dump-html writes <root>_p<N><ext> (x_p1.html, out_p2.html), one per page.
+*_p[0-9]*.html
+*_p[0-9]*.htm
+# Any page saved at the top of the repo. Nothing committed lives there as HTML.
+/*.html
 
 # --- a downloaded 2captcha proxy list is a credential file ------------------
 # Every line of one carries a login and a password. The glob covers the
@@ -78,13 +76,11 @@ env/
 secrets*
 
 # --- local research material ------------------------------------------------
-# `captures/` holds the raw pages this repo was built against: 28MB of real
-# HTML and sitemaps from bershkabeauty.com, fetched 2026-09-17/18. It is
-# EVIDENCE, kept on disk so a claim in the README can be re-checked, but it
-# is not repo content -- the fixtures the test suite actually runs against
-# are trimmed, scrubbed excerpts embedded in smoke_test.py, per CLAUDE.md
-# §10. A committed capture would also carry whatever per-visitor state the
-# page happened to hold.
+# `captures/` holds raw pages fetched while building this repo. They are
+# EVIDENCE, kept on disk so a claim in the README can be re-checked, but not
+# repo content -- the fixtures the suite runs against are trimmed, scrubbed
+# copies in fixtures/. A committed capture would also carry whatever
+# per-visitor state the page happened to hold.
 captures/
 
 # This repo's own working output
