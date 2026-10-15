@@ -4,14 +4,21 @@ name: canary
 # changing its markup before a user does.
 #
 # It requests THREE pages on purpose. With one page pagination is never
-# exercised, and that is exactly how a silent single-page bug survived in a
-# sibling repo: `--pages 3` fetched one page and exited 0, a complete-looking
-# success holding a third of the data.
+# exercised, and a run that silently fetched one page would read as complete.
 #
-# A GitHub runner is a datacentre address, and this edge refuses those. So the
-# live steps are guarded on the proxy secret and the job goes GREEN with a
-# ::notice:: when it is absent. A check that is always red teaches everyone to
-# ignore checks.
+# This canary CANNOT pass without an exit, and it says so in red. homedepot.com
+# answers HTTP 403 to a non-US address and a GitHub runner is a datacentre
+# address (README, measured 2026-09-22), so it needs ONE of these secrets:
+#
+#   HOMEDEPOT_PROXY         a US residential proxy URL. Runs http_scraper.py,
+#                           the repo's primary engine and its free path.
+#   HOMEDEPOT_CDP_ENDPOINT  a Scraping Browser endpoint with country-us. Runs
+#                           playwright_scraper.py over CDP. (A LOCAL Chromium
+#                           behind a proxy was refused 10 of 10 times in the
+#                           README's measurements, so it is not used here.)
+#
+# With neither, the job FAILS with an ::error:: naming them. A canary that
+# skipped green every day for weeks tested nothing, and its badge said it did.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -19,13 +26,13 @@ on:
 
 jobs:
   live:
-    runs-on: ubuntu-22.04   # NOT ubuntu-latest: playwright's --with-deps
-                            # apt step dies on 24.04.
+    runs-on: ubuntu-22.04
     env:
       # `secrets` is not available in a job-level `if`, so presence is tested
       # through job env and read in each step's `if`.
       HAS_PROXY: ${{ secrets.HOMEDEPOT_PROXY != '' }}
       HAS_CDP: ${{ secrets.HOMEDEPOT_CDP_ENDPOINT != '' }}
+      CANARY_URL: https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7
 
     steps:
       - uses: actions/checkout@v4
@@ -34,83 +41,59 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Explain the skip
+      - name: Require an exit
         if: env.HAS_PROXY != 'true' && env.HAS_CDP != 'true'
         run: |
-          echo "::notice::Skipped: no HOMEDEPOT_PROXY or HOMEDEPOT_CDP_ENDPOINT."
-          echo "::notice::Measured 2026-09-22, www.homedepot.com answers HTTP 403"
-          echo "::notice::to a non-US address, and a GitHub runner is a datacentre"
-          echo "::notice::address. A live run from here without an exit would be"
-          echo "::notice::red every day regardless of the code."
+          echo "::error::Missing secret: set HOMEDEPOT_PROXY (a US residential proxy, runs http_scraper.py) or HOMEDEPOT_CDP_ENDPOINT (a country-us Scraping Browser endpoint, runs playwright_scraper.py). homedepot.com refuses a GitHub runner's address, so without one this canary cannot reach the site and has not tested anything."
+          exit 1
 
       - name: Install
-        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-playwright.txt
-          playwright install --with-deps chromium
+          pip install -r requirements.txt
+          if [ "$HAS_PROXY" != "true" ]; then
+            # Over CDP the browser is remote: the Python package is enough,
+            # no local Chromium is downloaded.
+            pip install -r requirements-playwright.txt
+          fi
 
       - name: Live run
-        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
         # The credential goes through the ENVIRONMENT, never a --proxy flag on
-        # the command line: env_config.py already reads exactly these names, an
-        # unset secret arrives as an empty string which the loader treats as
-        # unset, and argv is readable by `ps` and lands in CI logs.
+        # the command line: env_config.py reads exactly these names, and argv
+        # is readable by `ps` and lands in CI logs.
         env:
           HOMEDEPOT_PROXY: ${{ secrets.HOMEDEPOT_PROXY }}
           HOMEDEPOT_CDP_ENDPOINT: ${{ secrets.HOMEDEPOT_CDP_ENDPOINT }}
-          TWOCAPTCHA_KEY: ${{ secrets.TWOCAPTCHA_KEY }}
         run: |
-          # GitHub runs `run:` under `bash -e`, so a non-zero command aborts
-          # the step BEFORE a following `echo "rc=$?"`. `continue-on-error`
-          # does not change that — it stops the step failing the job, not the
-          # shell's errexit.
+          # GitHub runs `run:` under `bash -e`; capture the exit code first.
           set +e
-          python3 playwright_scraper.py \
-            --url https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7 \
-            --pages 3 --out canary --format both --verbose
-          echo "rc=$?" >> "$GITHUB_ENV"
+          if [ "$HAS_PROXY" = "true" ]; then
+            unset HOMEDEPOT_CDP_ENDPOINT
+            python3 http_scraper.py --url "$CANARY_URL" \
+              --pages 3 --out canary --format both --verbose
+          else
+            unset HOMEDEPOT_PROXY
+            python3 playwright_scraper.py --url "$CANARY_URL" \
+              --pages 3 --out canary --format both --verbose
+          fi
+          rc=$?
           set -e
+          echo "rc=$rc" >> "$GITHUB_ENV"
+          echo "scraper exit code: $rc"
 
-      - name: Assert the data, not just the exit code
-        if: env.HAS_PROXY == 'true' || env.HAS_CDP == 'true'
+      - name: Assert the exit code and the data
         run: |
-          python3 - <<'PY'
-          import json, os, sys
-          rc = os.environ.get("rc", "?")
-          meta = json.load(open("canary.meta.json"))
-          rows = json.load(open("canary.json"))
-          fails = []
-          if meta["status"] != "complete":
-              fails.append("status=%s" % meta["status"])
-          if meta["pages_completed"] < 3:
-              fails.append("pages_completed=%s (pagination not exercised)"
-                           % meta["pages_completed"])
-          # Thresholds from the 2026-09-22 baseline: 35 rows over 3 pages,
-          # 35/35 on price, currency, brand and sku.
-          if len(rows) < 30:
-              fails.append("rows=%d (baseline 35)" % len(rows))
-          priced = sum(1 for r in rows if r["price"] is not None)
-          if priced < 0.95 * len(rows):
-              fails.append("price coverage %d/%d" % (priced, len(rows)))
-          if {r["currency"] for r in rows} - {"USD"}:
-              fails.append("unexpected currency")
-          if any(r["sku"] is None for r in rows):
-              fails.append("a row has no sku")
-          # One line, and it catches the strike-price regression forever.
-          bad = [r for r in rows if r["original_price"] is not None
-                 and r["price"] is not None and r["original_price"] <= r["price"]]
-          if bad:
-              fails.append("%d row(s) with original_price <= price" % len(bad))
-          if not {r["store_id"] for r in rows} - {None}:
-              fails.append("no store recorded — a price without its store is not a fact")
-          print("exit code from the run: %s" % rc)
-          print("store:", {(r["store_id"], r["store_name"]) for r in rows})
-          if fails:
-              print("::error::canary failed: %s" % "; ".join(fails))
-              sys.exit(1)
-          print("canary OK: %d rows, %d priced" % (len(rows), priced))
-          PY
+          case "$rc" in
+            0) ;;
+            3) echo "::error::exit 3: the site refused this exit. The secret is set but its address is not served — use a US residential exit."; exit 1 ;;
+            4) echo "::error::exit 4: zero products from a category that has them."; exit 1 ;;
+            5) echo "::error::exit 5: the site was never reached (timeout, dead proxy, expired CDP endpoint), or a served page parsed to nothing."; exit 1 ;;
+            6) echo "::error::exit 6: a partial run."; exit 1 ;;
+            *) echo "::error::scraper exited $rc"; exit 1 ;;
+          esac
+          # The row floor, core fields and pagination live in ci_checks.py, so
+          # they can be run locally against any output.
+          python3 .github/ci_checks.py --run-check --output-prefix canary
 
       - uses: actions/upload-artifact@v4
         if: always()

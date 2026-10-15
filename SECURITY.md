@@ -53,12 +53,12 @@ In scope:
 
 Not because these do not matter, but because they belong somewhere else:
 
-- **Bypassing Home Depot's bot protection.** This scraper calls the same public
-  API the storefront calls, from an exit the edge accepts. Anything about how
+- **Bypassing Home Depot's bot protection.** This scraper reads the same public
+  pages a browser is served, from an exit the edge accepts. Anything about how
   that edge decides which addresses it serves is not a vulnerability in this
   repository.
-- **The scraper stopped working.** Inditex changing its catalogue payload is
-  expected — file it as a normal issue, there is a template for exactly
+- **The scraper stopped working.** Home Depot changing how it ships its
+  catalogue is expected — file it as a normal issue, there is a template for exactly
   that.
 - **Anything about 2Captcha's services** — the solver API, the Scraping Browser
   API, proxies, fingerprints, billing, quotas. This repository is only a client

@@ -51,16 +51,25 @@ DEFAULT_OUT = "homedepot_products_scraperapi"
 _CREDENTIALS_IN_URL_RE = re.compile(r"(\w+://)[^/@\s]+:[^/@\s]+@")
 
 
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)((?:client)?key|token|api[_-]?key|password|passwd|pass|auth"
+    r"|authorization)(\s*[=:]\s*)(?:bearer\s+)?[^\s&;,\"']+")
+
+
 def _mask(text: str) -> str:
     """Mask GLOBALLY. A masker that handles only the first occurrence prints
-    the password the other four times and looks like it is working."""
-    return _CREDENTIALS_IN_URL_RE.sub(r"\1***:***@", text or "")
+    the password the other four times and looks like it is working.
+
+    Covers `user:pass@` inside a URL and `key=…` / `token: …` pairs, which is
+    how a debug header or an error body would carry a credential."""
+    text = _CREDENTIALS_IN_URL_RE.sub(r"\1***:***@", text or "")
+    return _SECRET_PARAM_RE.sub(r"\1\2***", text)
 
 
 class Fetched:
     __slots__ = ("status", "html", "headers")
 
-    def __init__(self, status: int, html: str, headers: Dict[str, str]):
+    def __init__(self, status: Optional[int], html: str, headers: Dict[str, str]):
         self.status = status
         self.html = html
         self.headers = headers
@@ -103,9 +112,11 @@ def fetch_one(args, url: str) -> Fetched:
     except Exception as exc:  # noqa: BLE001
         raise RemoteAPIError("%s: %s" % (type(exc).__name__, _mask(str(exc)))) from None
 
+    # The API's debug header can name the exit it used, credential included,
+    # so it is masked like everything else that reaches a log.
     debug = response.headers.get("x-debug")
     if debug:
-        logger.info("x-debug: %s", debug)
+        logger.info("x-debug: %s", _mask(str(debug)))
 
     if response.status_code != 200:
         # The API's OWN call failing, not the site refusing a page: 422 a task
@@ -114,12 +125,28 @@ def fetch_one(args, url: str) -> Fetched:
             "Scraper API returned HTTP %s: %s"
             % (response.status_code, _mask(response.text[:400])))
 
-    body = response.json()
+    try:
+        body = response.json()
+    except ValueError:
+        raise RemoteAPIError("Scraper API answered HTTP 200 with a body that "
+                             "is not JSON: %s" % _mask(response.text[:200])) from None
     text = body.get("body") or ""
     headers = {str(k).lower(): str(v) for k, v in (body.get("headers") or {}).items()}
-    upstream = int(body.get("status") or 0)
-    logger.info("upstream %s, %d bytes", upstream, len(text))
+    # Two different things, easy to swap: `http_code` is the TARGET site's
+    # status, `status` is the API's own verdict string ("ok", "warn"). The
+    # verdict can be "warn" on a 200 and on a 403 alike, so it says nothing
+    # about the page; it is logged, never parsed as a number.
+    upstream = _int_or_none(body.get("http_code"))
+    logger.info("upstream %s (api verdict %r), %d bytes",
+                upstream, body.get("status"), len(text))
     return Fetched(upstream, text, headers)
+
+
+def _int_or_none(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def scrape(args):
@@ -129,11 +156,26 @@ def scrape(args):
         "transport": "scraper-api", "country": args.country,
         "pages_requested": args.pages, "pages_completed": 0,
         "failed_pages": [], "states": [], "blocked": False,
+        "transport_error": None, "stop_reason": None,
         "start_url": args.url, "final_url": args.url,
     }
 
+    def get(target: str, page: int) -> Optional[Fetched]:
+        """One API call. Its failure ends the run HERE, so rows from earlier
+        pages are still written (a partial run) instead of being lost."""
+        try:
+            return fetch_one(args, target)
+        except RemoteAPIError as exc:
+            print("[!] %s" % exc, file=sys.stderr)
+            facts["transport_error"] = str(exc)[:300]
+            facts["failed_pages"].append(page)
+            facts["stop_reason"] = "remote_api_error"
+            return None
+
     if args.mode == "product":
-        result = fetch_one(args, args.url)
+        result = get(args.url, 1)
+        if result is None:
+            return rows, facts
         facts["states"].append(result.state)
         if page_flow.counts_as_blocked(result.state):
             facts["blocked"] = True
@@ -142,11 +184,15 @@ def scrape(args):
             rows = P.parse_product(result.html, url=args.url,
                                    category=args.category)
             facts["pages_completed"] = 1
+            if result.state == "product" and not rows:
+                facts["stop_reason"] = "parser_found_nothing"
         return rows, facts
 
     for page in range(1, args.pages + 1):
         target = P.page_url(args.url, page)
-        result = fetch_one(args, target)
+        result = get(target, page)
+        if result is None:
+            break
         state = result.state
         facts["states"].append(state)
         if page_flow.counts_as_blocked(state):
@@ -159,13 +205,26 @@ def scrape(args):
             print("page %d: that URL is a category hub, not a listing."
                   % page, file=sys.stderr)
             facts["failed_pages"].append(page)
+            facts["stop_reason"] = "hub_not_a_listing"
             break
+        blob = P.apollo_state(result.html)
+        if page == 1 and blob:
+            store = P.store_context(blob)
+            facts.update({k: store.get(k) for k in store})
         page_rows = P.parse_category(result.html, url=target,
                                      category=args.category)
         for row in page_rows:
             row.page = page
         fresh = output_writer.dedupe_by_sku(page_rows, seen)
         rows.extend(fresh)
+        facts["final_url"] = target
+        if state == "content" and not page_rows:
+            print("page %d: the page holds a listing grid but parsed to 0 "
+                  "rows — a parser failure, not an empty category." % page,
+                  file=sys.stderr)
+            facts["failed_pages"].append(page)
+            facts["stop_reason"] = "parser_found_nothing"
+            break
         facts["pages_completed"] = page
         if not page_rows or not fresh:
             break
@@ -184,10 +243,10 @@ def parse_args(argv=None):
     p.add_argument("--url", required=False, default=None)
     p.add_argument("--mode", choices=["category", "product"], default="category")
     p.add_argument("--category", default=None)
-    p.add_argument("--pages", type=int, default=1)
-    p.add_argument("--max-products", type=int, default=None)
-    p.add_argument("--delay", type=float, default=1.0)
-    p.add_argument("--timeout", type=int, default=MAX_API_TIMEOUT)
+    p.add_argument("--pages", type=_positive_int, default=1)
+    p.add_argument("--max-products", type=_positive_int, default=None)
+    p.add_argument("--delay", type=_non_negative_float, default=1.0)
+    p.add_argument("--timeout", type=_positive_int, default=MAX_API_TIMEOUT)
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--allow-empty", action="store_true")
@@ -206,6 +265,20 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     env_config.apply(args)
     return args
+
+
+def _positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be >= 1, got %s" % value)
+    return number
+
+
+def _non_negative_float(value):
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be >= 0, got %s" % value)
+    return number
 
 
 def main(argv=None) -> int:
@@ -228,7 +301,8 @@ def main(argv=None) -> int:
     except RemoteAPIError as exc:
         print("[!] %s" % exc, file=sys.stderr)
         return EXIT_REMOTE_API_ERROR
-    stop = ("blocked" if facts["blocked"] else
+    stop = (facts["stop_reason"] if facts["stop_reason"] else
+            "blocked" if facts["blocked"] else
             "single_page_mode" if args.mode == "product" else
             "completed" if facts["pages_completed"] >= args.pages else
             "no_new_products")
@@ -238,7 +312,12 @@ def main(argv=None) -> int:
                       pages_completed=int(facts["pages_completed"]),
                       pages_failed=facts["failed_pages"], mode=args.mode,
                       start_url=str(facts["start_url"]),
-                      final_url=str(facts["final_url"]), extra=facts)
+                      final_url=str(facts["final_url"]),
+                      scope=output_writer.scope_fingerprint(
+                          store_id=output_writer.run_store_id(facts, rows),
+                          category=args.category,
+                          max_products=args.max_products),
+                      extra=facts)
 
 
 if __name__ == "__main__":

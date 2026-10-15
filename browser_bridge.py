@@ -10,7 +10,7 @@ takes a function BODY with an explicit `return`, while Playwright and
 pyppeteer take `() => expr`; a shared module that passed JS would quietly
 acquire one driver's dialect. The driver protocol below names OPERATIONS
 instead (`content()`, `count(selector)`), and each engine writes its own
-one-liner (CLAUDE.md §1).
+one-liner.
 
 The challenge ladder on this site
 ---------------------------------
@@ -22,12 +22,15 @@ client executes, then reloads itself. A real browser clears it with no help,
 which is why `wait_out_challenge` below waits and re-reads rather than
 reaching for anything paid.
 
-Rung 2 — the **2Captcha solver API**, for a real captcha with a sitekey.
+Rung 2 — the **2Captcha solver API**, for a real reCAPTCHA with a sitekey.
 Measured 2026-09-22: no such widget appears on a listing or product page, so
 this rung exists for the case where one starts appearing, not because one
-did. `--solve-captcha when-blocked` (the default) keeps it a fallback: it
-fires only after the browser has failed to clear the page, and it counts
-products on the spot rather than running the full readiness wait first.
+did. It fires only for a page classified `captcha`, after the browser has
+had its chance, and it is held to `page_flow.SOLVES_PER_PAGE` paid solves per
+page. It buys a token only when it can also USE it: the engine must be able
+to inject the token into the page, and the widget must be a kind the solver
+implements (reCAPTCHA Enterprise is not implemented here, so it is never
+paid for).
 
 A 403 is NOT on this ladder at all. It is a decision about the address, has
 no puzzle in it, and the only useful response is a different exit.
@@ -46,7 +49,10 @@ import output_writer
 import page_flow
 import product_parser as P
 import proxy_pool
-from output_writer import EXIT_REMOTE_API_ERROR, Product, finish_run
+from output_writer import Product, finish_run
+
+# argparse's own exit code for a usage error.
+EXIT_USAGE = 2
 
 logger = logging.getLogger("homedepot")
 
@@ -64,7 +70,7 @@ CARD_SELECTOR = 'a[href*="/p/"]'
 # artefact. In practice this site is paged by `?Nao=`, which
 # `product_parser.page_url` constructs, so a missing next-link is not fatal —
 # but a selector that agrees is worth having, and one that has silently died
-# must not be the only thing pagination rests on (CLAUDE.md §7).
+# must not be the only thing pagination rests on.
 NEXT_PAGE_SELECTOR = (
     'head link[rel="next"]',
     'a[aria-label="Next"]',
@@ -72,6 +78,10 @@ NEXT_PAGE_SELECTOR = (
 )
 
 CHALLENGE_SETTLE_MS = 25000
+
+# A reCAPTCHA Enterprise widget needs the solver's enterprise task, which this
+# repository does not implement, so a page carrying one is never paid for.
+ENTERPRISE_MARKERS = ("grecaptcha.enterprise", "recaptcha/enterprise.js")
 CHALLENGE_POLL_MS = 1000
 
 
@@ -112,6 +122,14 @@ class BridgeError(RuntimeError):
 #   attr(sel, a)  -> Optional[str]   one attribute off the first match
 #   sleep(ms)
 #   stop()
+#
+# And two OPTIONAL operations, used only by the paid captcha rung:
+#   recaptcha_discovery() -> Optional[dict]  run captcha_solver's
+#                                            RECAPTCHA_DISCOVERY_JS in the page
+#   inject_captcha_token(token) -> bool      run captcha_solver's
+#                                            INJECT_TOKEN_JS with the token
+# A driver without `inject_captcha_token` never gets a token bought for it:
+# a token nobody can put into the page is money spent for nothing.
 #
 # Nothing here calls anything else on it.
 
@@ -182,20 +200,41 @@ def wait_out_challenge(driver, url: str, log=None,
     return latest, False
 
 
-def solve_if_captcha(driver, args, url: str, html: str, log=None) -> Optional[str]:
-    """Rung 2. Returns fresh HTML if a solve happened, else None.
+def solve_if_captcha(driver, args, url: str, html: str, log=None,
+                     budget: Optional[page_flow.SolveBudget] = None
+                     ) -> Optional[str]:
+    """Rung 2. Returns fresh HTML if a token was bought and injected, else None.
+
+    Every condition that would make a purchase useless is checked BEFORE
+    anything is bought: the state policy says this state is payable, the
+    page's allowance is not spent, a key is set, the widget is a kind the
+    solver implements, and the engine can put the token into the page.
 
     A missing key or a solver error is a WARNING, not a crash: the run
-    continues and reports exit 3 if it really was blocked (CLAUDE.md §8).
+    continues and reports exit 3 if the page really was gated.
     """
     if getattr(args, "solve_captcha", "when-blocked") == "never":
         return None
-    if P.detect_page_state(html, url=url) != "captcha":
+    state = P.detect_page_state(html, url=url)
+    if not page_flow.should_solve(state):
+        return None
+    if budget is None:
+        budget = page_flow.SolveBudget()
+    if not budget.allow():
+        print("[!] a captcha is still on the page, but this page's paid-solve "
+              "allowance (%d) is spent — not buying another."
+              % budget.limit, file=sys.stderr)
         return None
     key = getattr(args, "twocaptcha_key", None)
     if not key:
         print("[!] a captcha was detected but no TWOCAPTCHA_KEY is set — "
               "continuing without solving.", file=sys.stderr)
+        return None
+    inject = getattr(driver, "inject_captcha_token", None)
+    if inject is None:
+        print("[!] a captcha was detected, but the %s engine cannot inject a "
+              "token into the page, so none is bought." % driver.name,
+              file=sys.stderr)
         return None
     try:
         import captcha_solver
@@ -203,19 +242,59 @@ def solve_if_captcha(driver, args, url: str, html: str, log=None) -> Optional[st
         print("[!] captcha detected but the solver is unavailable: %s" % exc,
               file=sys.stderr)
         return None
+
+    static = captcha_solver.detect_recaptcha_v3(html, url)
+    runtime = None
+    info = None
+    discovery = getattr(driver, "recaptcha_discovery", None)
+    if discovery is not None:
+        try:
+            info = discovery()
+        except Exception as exc:  # noqa: BLE001 — a page mid-navigation
+            log and log("  in-page captcha discovery failed: %s"
+                        % mask_text(str(exc))[:160])
+        if info:
+            runtime = captcha_solver.detect_recaptcha_in_page(
+                lambda _js: info, page_url=url)
+    challenge = captcha_solver.reconcile_detections(static, runtime)
+    if challenge is None or not challenge.sitekey:
+        print("[!] the page is classified as a captcha, but no sitekey could "
+              "be read from it — nothing to send to a solver, nothing bought.",
+              file=sys.stderr)
+        return None
+    # The site's global config carries a `recaptchaEnterprise` feature flag on
+    # every page, so the WORD is no evidence. The enterprise loader or API on
+    # the page, or the live client saying so, is.
+    lowered = (html or "").lower()
+    if (isinstance(info, dict) and info.get("enterprise")) or any(
+            marker in lowered for marker in ENTERPRISE_MARKERS):
+        print("[!] this looks like reCAPTCHA Enterprise, which this repository "
+              "does not implement — not buying a token the site would reject.",
+              file=sys.stderr)
+        return None
+
+    budget.spend()
     try:
-        solved = captcha_solver.solve_on_page(
-            driver, html, url=url, api_key=key,
+        token = captcha_solver.solve_recaptcha(
+            challenge, key,
             api_version=getattr(args, "captcha_api", "v2"),
             min_score=getattr(args, "min_score", 0.7))
     except Exception as exc:  # noqa: BLE001 — a solver failure is not a crash
         print("[!] solver failed: %s: %s"
               % (type(exc).__name__, mask_text(str(exc))), file=sys.stderr)
         return None
-    if not solved:
+    if not token:
+        return None
+    try:
+        injected = inject(token)
+    except Exception as exc:  # noqa: BLE001
+        print("[!] could not inject the token: %s: %s"
+              % (type(exc).__name__, mask_text(str(exc))), file=sys.stderr)
+        return None
+    if injected is False:
         return None
     if log:
-        log("  solver returned a token; re-reading the page")
+        log("  solver returned a token and it was injected; re-reading the page")
     driver.sleep(3000)
     return driver.content()
 
@@ -246,18 +325,53 @@ def fetch_page(driver, args, url: str, log=None) -> Dict[str, Any]:
             html = wait_for_content(driver, args, url, 10000, log=log)
             state = P.detect_page_state(html, url=url)
 
+    # ONE allowance per page, created here and handed to the only call site.
+    budget = page_flow.SolveBudget()
     if state == "captcha":
-        fresh = solve_if_captcha(driver, args, url, html, log=log)
+        fresh = solve_if_captcha(driver, args, url, html, log=log,
+                                 budget=budget)
         if fresh:
             html = fresh
             state = P.detect_page_state(html, url=url)
 
-    return {"html": html, "state": state, "status": status}
+    return {"html": html, "state": state, "status": status,
+            "solves_bought": budget.spent}
+
+
+def not_served_message(page: int, state: str, status, html: str,
+                       headless: Optional[bool] = None) -> str:
+    """What a not-served page looked like, before any guess at why.
+
+    A document under 100 bytes that names none of the site's own asset hosts
+    is not a refusal page — Akamai's is ~370 bytes and the interstitial
+    ~2.5 KB — it is an empty document, which means the navigation produced
+    nothing. Calling that "blocked" sends the reader to buy an exit for a
+    fault in their own browser.
+    """
+    size = len(html or "")
+    served = P.looks_site_served(html or "")
+    line = ("page %d: %s (HTTP %s, %d bytes, site assets %s)"
+            % (page, state, status, size, "present" if served else "absent"))
+    if size < 100 and not served:
+        line += (" — an EMPTY document: the navigation did not complete, so "
+                 "this says nothing about the site")
+    elif state == "blocked":
+        line += (" — Akamai refused this address; a US residential exit is "
+                 "what this site serves")
+        if headless:
+            line += " (this run was headless)"
+    return line
 
 
 # ---------------------------------------------------------------------------
 # The run
 # ---------------------------------------------------------------------------
+
+def _is_empty_document(html: str) -> bool:
+    """A navigation that produced nothing: no bytes worth the name and none
+    of the site's own assets. Not a refusal (see not_served_message)."""
+    return len(html or "") < 100 and not P.looks_site_served(html or "")
+
 
 def run(args, driver) -> int:
     """Drive one browser engine end to end and return its exit code."""
@@ -266,13 +380,14 @@ def run(args, driver) -> int:
 
     url = args.url
     if not url:
-        raise SystemExit(
-            "nothing to fetch: pass --url with a leaf category or product "
-            "address, e.g. https://www.homedepot.com/b/"
-            "Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7")
+        print("usage error: nothing to fetch: pass --url with a leaf category "
+              "or product address, e.g. https://www.homedepot.com/b/"
+              "Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7", file=sys.stderr)
+        return EXIT_USAGE
     ok, reason = P.supported_host(url)
     if not ok:
-        raise SystemExit("refusing %s: %s" % (url, reason))
+        print("usage error: refusing %s: %s" % (url, reason), file=sys.stderr)
+        return EXIT_USAGE
 
     facts: Dict[str, Any] = {
         "transport": driver.name,
@@ -281,6 +396,7 @@ def run(args, driver) -> int:
         "failed_pages": [],
         "states": [],
         "blocked": False,
+        "solves_bought": 0,
         "start_url": url,
         "final_url": url,
     }
@@ -293,20 +409,32 @@ def run(args, driver) -> int:
         print("could not start %s: %s: %s"
               % (driver.name, type(exc).__name__, mask_text(str(exc))),
               file=sys.stderr)
-        return EXIT_REMOTE_API_ERROR
+        facts["transport_error"] = "start: %s" % mask_text(str(exc))[:300]
+        return _finish(args, rows, facts, "transport_failed")
 
+    stop_reason: Optional[str] = None
     try:
         if args.mode == "product":
             result = fetch_page(driver, args, url, log=log)
             facts["states"].append(result["state"])
+            facts["solves_bought"] += result.get("solves_bought", 0)
             _dump(args, result["html"], 1)
             if page_flow.counts_as_blocked(result["state"]):
-                facts["blocked"] = True
                 facts["failed_pages"].append(1)
+                print(not_served_message(1, result["state"], result["status"],
+                                         result["html"],
+                                         getattr(args, "headless", None)),
+                      file=sys.stderr)
+                if _is_empty_document(result["html"]):
+                    stop_reason = "empty_document"
+                else:
+                    facts["blocked"] = True
             else:
                 rows = P.parse_product(result["html"], url=url,
                                        category=args.category)
                 facts["pages_completed"] = 1
+                if result["state"] == "product" and not rows:
+                    stop_reason = "parser_found_nothing"
         else:
             for page in range(1, args.pages + 1):
                 target = P.page_url(url, page)
@@ -314,14 +442,19 @@ def run(args, driver) -> int:
                 result = fetch_page(driver, args, target, log=log)
                 state = result["state"]
                 facts["states"].append(state)
+                facts["solves_bought"] += result.get("solves_bought", 0)
                 _dump(args, result["html"], page)
 
                 if page_flow.counts_as_blocked(state):
-                    facts["blocked"] = True
                     facts["failed_pages"].append(page)
-                    print("page %d: %s (HTTP %s, %d bytes)"
-                          % (page, state, result["status"], len(result["html"])),
+                    print(not_served_message(page, state, result["status"],
+                                             result["html"],
+                                             getattr(args, "headless", None)),
                           file=sys.stderr)
+                    if _is_empty_document(result["html"]):
+                        stop_reason = "empty_document"
+                    else:
+                        facts["blocked"] = True
                     break
                 if state == "hub":
                     print("page %d: that URL is a category HUB, not a product "
@@ -343,10 +476,21 @@ def run(args, driver) -> int:
                     row.page = page
                 fresh = output_writer.dedupe_by_sku(page_rows, seen)
                 rows.extend(fresh)
-                facts["pages_completed"] = page
+                facts["final_url"] = target
                 log("  %s: %d rows (%d new, %d total)"
                     % (state, len(page_rows), len(fresh), len(rows)))
 
+                if state == "content" and not page_rows:
+                    # The classifier found listing products on this page and
+                    # the parser returned none: that is OUR bug, not an empty
+                    # category.
+                    print("page %d: the page holds a listing grid but parsed "
+                          "to 0 rows — a parser failure, not an empty "
+                          "category." % page, file=sys.stderr)
+                    facts["failed_pages"].append(page)
+                    stop_reason = "parser_found_nothing"
+                    break
+                facts["pages_completed"] = page
                 if not page_rows or not fresh:
                     log("  page %d added no new skus — end of listing." % page)
                     break
@@ -356,19 +500,15 @@ def run(args, driver) -> int:
                 if page < args.pages:
                     time.sleep(args.delay)
     except BridgeError as exc:
-        # A transport fault, NOT a refusal — see BridgeError. The run reports
-        # exit 5 and does not claim the site blocked it.
+        # A transport fault, NOT a refusal — see BridgeError. Rows already
+        # gathered are kept: the run finishes as partial (6), or as "content
+        # never obtained" (5) when there are none.
         print("[!] %s" % exc, file=sys.stderr)
-        facts["transport_error"] = str(exc)
-        try:
-            driver.stop()
-        except Exception:
-            pass
-        return EXIT_REMOTE_API_ERROR
-    except Exception as exc:  # noqa: BLE001
-        print("[!] %s: %s" % (type(exc).__name__, mask_text(str(exc))),
-              file=sys.stderr)
-        return EXIT_REMOTE_API_ERROR
+        facts["transport_error"] = str(exc)[:300]
+        failed = facts["pages_completed"] + 1
+        if failed not in facts["failed_pages"]:
+            facts["failed_pages"].append(failed)
+        stop_reason = "transport_failed"
     finally:
         try:
             driver.stop()
@@ -376,21 +516,29 @@ def run(args, driver) -> int:
             logger.warning("%s did not shut down cleanly: %s",
                            driver.name, mask_text(str(exc)))
 
+    return _finish(args, rows, facts, stop_reason or _stop_reason(args, facts),
+                   driver=driver)
+
+
+def _finish(args, rows, facts, stop_reason: str, driver=None) -> int:
     # Whether rung 1a did anything is a FACT about the run, so it goes in the
     # sidecar rather than only into a log line nobody kept.
     facts["autosolve_armed"] = getattr(driver, "autosolve_armed", False)
     facts["autosolve_events"] = getattr(driver, "autosolve_events", [])
     facts["autosolve_notes"] = getattr(driver, "autosolve_notes", [])
-
     return finish_run(
         rows, args.out, args.format, args.allow_empty,
         blocked=facts["blocked"],
-        stop_reason=_stop_reason(args, facts),
+        stop_reason=stop_reason,
         pages_requested=args.pages,
         pages_completed=facts["pages_completed"],
         pages_failed=facts["failed_pages"],
         mode=args.mode,
         start_url=facts["start_url"], final_url=facts["final_url"],
+        scope=output_writer.scope_fingerprint(
+            store_id=output_writer.run_store_id(facts, rows),
+            category=args.category,
+            max_products=getattr(args, "max_products", None)),
         extra=facts,
     )
 

@@ -17,7 +17,7 @@ So the only guard that actually protects anything is one that runs on YOUR
 machine, before the commit object exists.
 
     python3 tools/scan_secrets.py --staged     # what is about to be committed
-    python3 tools/scan_secrets.py --worktree   # every tracked file
+    python3 tools/scan_secrets.py --worktree   # tracked + untracked, not ignored
     python3 tools/scan_secrets.py --range A..B # commits about to be pushed
     python3 tools/scan_secrets.py --history    # every blob that ever existed
 
@@ -134,17 +134,56 @@ def scan_staged() -> int:
     return _report(findings)
 
 
+def _in_virtualenv(name: str, cache: dict) -> bool:
+    """Whether `name` (a repo-relative path) sits inside a virtualenv.
+
+    Recognised by the `pyvenv.cfg` file that DEFINES a virtualenv, never by
+    its directory name: an environment called anything at all is still full
+    of vendored code whose hex constants look like keys. Only ancestors
+    INSIDE the repository are inspected, so a clone that itself lives under
+    a directory called `venv`, `tmp` or `build` is scanned normally.
+    """
+    import os
+    parts = name.split("/")[:-1]
+    for depth in range(1, len(parts) + 1):
+        directory = "/".join(parts[:depth])
+        if directory not in cache:
+            cache[directory] = os.path.isfile(os.path.join(directory, "pyvenv.cfg"))
+        if cache[directory]:
+            return True
+    return False
+
+
+def worktree_names():
+    """Tracked files, plus untracked files that are NOT ignored — the ones a
+    `git add -A` would pick up next. Ignored files (a real `.env`, run
+    output) cannot be staged that way and are left alone."""
+    tracked = [n for n in _git("ls-files", "-z").split("\0") if n]
+    untracked = [n for n in _git("ls-files", "-z", "--others",
+                                 "--exclude-standard").split("\0") if n]
+    cache: dict = {}
+    return [n for n in tracked + untracked if not _in_virtualenv(n, cache)]
+
+
 def scan_worktree() -> int:
-    names = [n for n in _git("ls-files", "-z").split("\0") if n]
+    names = worktree_names()
     findings = []
+    scanned = 0
     for name in names:
         try:
             with open(name, encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
         except OSError:
             continue
+        scanned += 1
         for what in scan_text(name, text):
             findings.append((name, what))
+    # A scan that read nothing must not print "clean".
+    print("secret scan: %d file(s) read" % scanned)
+    if scanned == 0:
+        print("secret scan: NOTHING was read — refusing to call that clean",
+              file=sys.stderr)
+        return 1
     return _report(findings)
 
 
@@ -185,6 +224,13 @@ def main(argv=None) -> int:
     group.add_argument("--range", dest="rev_range")
     group.add_argument("--history", action="store_true")
     args = parser.parse_args(argv)
+    # Paths below are repo-relative, so work from the repository root
+    # whatever directory this was started from.
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    top = _git("-C", here, "rev-parse", "--show-toplevel").strip()
+    if top:
+        os.chdir(top)
 
     if args.staged:
         code = scan_staged()

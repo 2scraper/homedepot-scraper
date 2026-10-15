@@ -66,10 +66,7 @@ _PLACEHOLDERS = {
 # a copied example reads as CONFIGURED: `cp .env.example .env` followed by a
 # run connects to cb.2captcha.com with the string `{login}-zone-...` as its
 # username and gets a 401 -- a confusing auth error a long way from its
-# cause. This exact defect shipped in this family's etsy-scraper and
-# a sibling repo (both of which use braced placeholders) and was absent
-# from amazon-scraper/a sibling repo only because neither of those uses
-# them -- see CLAUDE.md §17. Any `{...}` left in a value is unset here,
+# cause. Any `{...}` left in a value is unset here,
 # named rather than quoted in the warning, since the value can be a
 # credentialled URL.
 _BRACED_PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")

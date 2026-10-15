@@ -25,25 +25,20 @@ Five buckets, each keyed on sku:
   unmatched      — a row this project's parser could not recover a sku for,
                    counted rather than folded into added/removed
 
-Why `source_changed` exists here when the a sibling repo sibling has no such
-bucket: this site has FOUR ways of stating a price and they are not equally
-trustworthy — a tile's microdata, a gift-set tile's bare text, a product
-page's JSON-LD, and a product page's rendered price (see
-output_writer.Product.price_source). A category run and a product run of the
-same sku therefore read the same price through different instruments, and
-so do two category runs if the site changes a tile from a set-price block to
-a normal one. Reporting that as a price change would be reporting our own
-instrument, which is exactly the false "price changed" CLAUDE.md §8 forbids.
+Why `source_changed` exists: a listing row reads its price from the
+listing's Apollo state and a product row from the product page's JSON-LD
+(see output_writer.Product.price_source). A category run and a product run of
+the same sku therefore read the same price through different instruments, and
+reporting that difference as a price move would be reporting our own
+instrument rather than the shelf.
 
-There is no `--price-tolerance-pct`: every row of one run comes from one
-locale and therefore one currency (`price` and `currency` are read together
-from the same node), so there is no exchange-rate tick to absorb. A price on
-this site moves in whole currency units, not continuously.
+Prices and stock belong to a STORE. Two runs made from two different stores
+are two different price lists, so this tool refuses to compare them (unless
+--force), using each run's `scope.store_id` and, failing that, the store the
+rows themselves name.
 
-A run against a showcase locale (`int/en`, `ru`) has `price=None` on every
-row. Diffing two of those is legitimate and reports title, availability and
-delisting changes; it will simply never report a price change, because the
-site publishes none.
+There is no `--price-tolerance-pct`: every row is in USD and a price on this
+site moves in whole cents, not continuously.
 """
 
 import argparse
@@ -57,32 +52,22 @@ from output_writer import UNIQUE_BY_SKU_MODES
 TRACKED_FIELDS = (
     # Family prefix — the two every repo in this family diffs.
     "price", "currency",
-    # What actually moves on this catalogue between two runs. A row here is
-    # one SKU — a (product, colour, size) triple — so these are all
-    # properties of that exact SKU and not of the product it belongs to:
-    # a markdown starting or ending (`original_price` goes from None to a
-    # figure and back), the size going out of stock or being flagged for
-    # restock, a rename, and the promotion behind a discount changing.
+    # What actually moves on this catalogue between two runs of one store: a
+    # markdown starting or ending (`original_price` goes from None to a figure
+    # and back), stock at the store and in its local-delivery pool, a rename,
+    # and the product's rating.
     "original_price", "discount_pct", "availability", "title",
-    "is_buyable", "back_soon", "promotion_id",
-    # NOT tracked, and each for its own measured reason:
+    "store_quantity", "local_delivery_quantity", "rating", "review_count",
+    # NOT tracked, and each for its own reason:
     #
-    #   `image_url`      — carries a `?ts=` cache-buster that moves without
-    #                      the image moving.
-    #   `scraped_at`     — the clock, not the catalogue.
-    #   `page`/`row_index` — a row's position inside a payload. Measured
-    #                      2026-09-20: two runs of one category twenty
-    #                      minutes apart produced identical rows with 44 of
-    #                      131 row_index values changed, because the grid
-    #                      reordered. Tracking it would report every such
-    #                      run as 44 changes and nothing real.
-    #   `color_name`/`size_name` — part of the SKU's identity, not a
-    #                      property that changes under it. If one of them
-    #                      changed for a given `sku`, the right report is
-    #                      that the site reused an id, which is a different
-    #                      and louder event than a field edit.
-    #   `related_categories` — merchandising. A product moving between
-    #                      collections is not a change to the product.
+    #   `image_url`        — a CDN address, which moves without the image
+    #                        moving.
+    #   `scraped_at`       — the clock, not the catalogue.
+    #   `page`/`row_index` — a row's position in a grid that reorders between
+    #                        runs; tracking it reports movement, not change.
+    #   `badges`           — merchandising labels, not a property of the item.
+    #   `store_id` and the other store columns — a different store is a
+    #                        different run, refused before rows are compared.
 )
 
 
@@ -181,11 +166,28 @@ def _run_status(path: str):
     return meta.get("status"), meta
 
 
+def _run_store(path: str):
+    """The store a run priced: its sidecar's scope, else the one store all of
+    its rows name. None when unknown."""
+    _, meta = _run_status(path)
+    meta = meta or {}
+    store = (meta.get("scope") or {}).get("store_id") or \
+        (meta.get("transport_facts") or {}).get("store_id")
+    if store:
+        return str(store)
+    try:
+        rows = _load(path)
+    except (OSError, ValueError):
+        return None
+    found = {str(r.get("store_id")) for r in rows
+             if isinstance(r, dict) and r.get("store_id")}
+    return found.pop() if len(found) == 1 else None
+
+
 def _check_comparable(args) -> bool:
-    """Refuse a diff between runs that are not both complete, or that are
-    different modes. See a sibling repo's diff_runs.py for the full
-    rationale — unchanged here except that this repo's modes are named
-    category/product.
+    """Refuse a diff between runs that are not both complete, that are
+    different modes, or that priced different stores. A partial run's
+    unfetched pages would otherwise read as delisted products.
     """
     problems = []
     modes = {}
@@ -205,10 +207,20 @@ def _check_comparable(args) -> bool:
                 f"{label} ({path}) was a {status!r} run — stopped after "
                 f"{meta.get('pages_completed')} of {meta.get('pages_requested')} "
                 f"page(s), reason {meta.get('stop_reason')!r}")
+    stores = {}
+    for label, path in (("--old", args.old), ("--new", args.new)):
+        store = _run_store(path)
+        if store:
+            stores[label] = store
+    if len(set(stores.values())) > 1:
+        problems.append(
+            f"the two runs priced different stores ({stores}). Home Depot "
+            f"prices and stocks per store, so every difference would be the "
+            f"store, not the catalogue.")
     if len(set(modes.values())) > 1:
         problems.append(
-            f"the two runs are different modes ({modes}). A category "
-            f"row and a transfer row carry different fields, so "
+            f"the two runs are different modes ({modes}). A category run "
+            f"and a product run cover different sets of products, so "
             f"added/removed would describe the mode change rather than the "
             f"data.")
     if not problems:
@@ -235,7 +247,8 @@ def parse_args():
                         "for a cron job that should only notify on a real diff.")
     p.add_argument("--force", action="store_true",
                    help="Diff even when a run's .meta.json says it was "
-                        "partial or failed, or the modes differ.")
+                        "partial or failed, the modes differ, or the two "
+                        "runs priced different stores.")
     return p.parse_args()
 
 

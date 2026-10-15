@@ -3,15 +3,12 @@ captcha_solver.py
 ------------------
 Shared helper used by all three scrapers (Playwright / Selenium / Puppeteer).
 
-Detection runs after EVERY page navigation in the main loop of all three
-scrapers, regardless of what URL was requested (category hub, product page,
-sign-in, checkout, anything) — this is deliberate, not scoped to any one
-page. If Home Depot renders a reCAPTCHA/Turnstile challenge anywhere —
-this fires. Live research for this repo (2026-09-10, one proxied fetch each
-of a ranking page, a player profile, a squad page and a transfer list, all
-served without any challenge or 403) found none, but that is a much smaller
-sample than the family's other members ran before writing this note — see
-the closing section of this file for what that does and does not license.
+The browser engines classify every page they load; a page classified
+`captcha` reaches `browser_bridge.solve_if_captcha`, which uses the
+detectors and the solver below. The README records what was measured on
+homedepot.com: no widget on a listing or a product page, so this path exists
+for the case where one starts appearing — see the closing section of this
+file for what that does and does not license.
 
 Flow:
   1. Both detectors run and are reconciled (see reconcile_detections) to decide
@@ -99,7 +96,7 @@ class CaptchaChallenge:
     page_url: str = ""
     # AWS WAF only. Its task needs three values that all live together in
     # `window.gokuProps` on the challenge page, plus the two script URLs the
-    # page loads. Unlike Cloudflare Turnstile (§19 of the family notes),
+    # page loads. Unlike Cloudflare Turnstile,
     # nothing has to be intercepted at runtime to get them: AWS WAF prints
     # all of it into the served HTML, so a static read is enough.
     iv: Optional[str] = None
@@ -151,7 +148,7 @@ class CaptchaChallenge:
     def has_captcha_widget(self) -> bool:
         """Is there a widget on this page for a solver to work on?
 
-        Section 19's rule: "unsolvable" is a property of a PAGE, not of a
+        "Unsolvable" is a property of a PAGE, not of a
         vendor, and it means the page carries no widget. A challenge-action
         page carries none, so sending it to a solver buys a token for a
         puzzle that was never rendered -- measured at $0.00145 a time, since
@@ -269,9 +266,8 @@ def detect_recaptcha_v3(html: str, page_url: str) -> Optional[CaptchaChallenge]:
        attributes (data-captcha-type="recaptcha" data-version="v3"
        data-sitekey="..." data-action="..."), with the actual execute()
        call happening inside a bundled JS file, never appearing as
-       readable inline script text at all — confirmed live on the sibling
-       a sibling repo repo's target,
-       sign-up modal via DevTools inspection. A previous version of this
+       readable inline script text at all — confirmed live on another
+       site's sign-up modal via DevTools inspection. A previous version of this
        function, which only checked for format 1, reported "no captcha"
        on this exact page despite one being genuinely present — caught by
        manually inspecting the DOM, not by the detector itself, which is
@@ -320,7 +316,7 @@ def detect_recaptcha_v3(html: str, page_url: str) -> Optional[CaptchaChallenge]:
 
 # ---------------------------------------------------------------------------
 # Runtime detection (added 2026-08-24 — the static-HTML detector below no
-# longer matched the sibling a sibling repo repo's target)
+# longer matched another site's markup)
 # ---------------------------------------------------------------------------
 #
 # What changed there: the sign-up modal used to render
@@ -937,4 +933,4 @@ solve_recaptcha_v3 = solve_recaptcha
 # what the address has been doing — a narrow list is how a challenge gets
 # reported as an empty page months later. A solver for a challenge this site
 # has never been observed to serve is dead code; a DETECTOR for one is cheap
-# insurance. See the family note in CLAUDE.md.
+# insurance.

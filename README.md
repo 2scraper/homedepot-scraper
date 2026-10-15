@@ -323,7 +323,6 @@ pyppeteer exist for parity: same flags, same exit codes, same run metadata.
 | Authenticated remote CDP | n/a | yes | yes | **no** | — |
 | Authenticated proxy | yes | yes | yes | **no** | n/a |
 | Rotates exits on a refusal | yes | no | no | no | no |
-| `--fingerprint` | n/a | yes | no | yes | ignored |
 
 **Live-verified** means it has fetched and parsed a real page from this site.
 pyppeteer and Selenium have been exercised in their own virtualenvs — `pip
@@ -363,14 +362,18 @@ touching it and wait.
 | `2` | Bad usage (including a URL that is not a homedepot.com host) |
 | `3` | Blocked — the site refused this scraper |
 | `4` | Zero products — including a hub category, which is a correct answer |
-| `5` | Remote/transport error — **our** plumbing, not the site |
+| `5` | The content was never obtained — **our** plumbing, not the site |
 | `6` | Partial — some pages fetched, then stopped early |
 
 **`3` and `5` mean different things and the difference matters.** `5` covers a
-navigation timeout, a dropped CDP socket, a `profile_locked` profile, and a
-proxy credential that no longer authenticates (HTTP 407 on the CONNECT tunnel —
-homedepot.com is never reached at all). Reporting any of those as `3` sends you
-to the anti-bot problem when the answer is somewhere else entirely.
+navigation timeout, a dropped connection or CDP socket, an empty document from
+a navigation that never completed, a `profile_locked` profile, a proxy
+credential that no longer authenticates (HTTP 407 on the CONNECT tunnel —
+homedepot.com is never reached at all), a failed Scraper API call, and a page
+that lists products but parsed to none (a parser failure, not an empty
+category). Reporting any of those as `3` sends you to the anti-bot problem
+when the answer is somewhere else entirely. If one of them happens AFTER some
+pages already gave rows, the rows are written and the run exits `6`.
 
 **A run that finds nothing writes nothing.** Last night's good output is not
 replaced with `[]`; `--allow-empty` is the opt-out.
@@ -429,7 +432,7 @@ site.
 ## Testing
 
 ```bash
-python3 smoke_test.py          # 524 offline checks, no network, no browser
+python3 smoke_test.py          # the offline checks, no network, no browser
 python3 -m pytest -q           # the same suite, as one pytest test
 python3 .github/ci_checks.py --all
 ```
@@ -463,8 +466,11 @@ What the 2Captcha products buy:
 * **Scraping Browser API** — `HOMEDEPOT_CDP_ENDPOINT`. **The only browser
   transport measured to work here**, because a local Chromium is refused
   outright. `country-us` picks the exit; `pid-` is a persistent profile.
-* **[Captcha solving](https://2captcha.com)** — `TWOCAPTCHA_KEY`. Armed on
-  every CDP connection and, on this site, it has never had anything to do.
+* **[Captcha solving](https://2captcha.com)** — `TWOCAPTCHA_KEY`. On this site
+  it has never had anything to do: no widget has appeared on a listing or a
+  product page. If one does, the browser engines buy at most one solve per
+  page, and only for a reCAPTCHA they can inject the token into
+  (reCAPTCHA Enterprise is not implemented here and is never paid for).
 * **Fingerprints** — `fingerprint_client.py`. Not needed over CDP, where the
   remote browser brings its own and stacking a second creates a contradiction
   rather than better cover.

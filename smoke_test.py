@@ -915,7 +915,10 @@ def test_a_transport_fault_is_not_a_block():
         def sleep(self, ms): pass
         def stop(self): pass
 
-    rc = browser_bridge.run(Args(), Driver())
+    with tempfile.TemporaryDirectory() as tmp:
+        args = Args()
+        args.out = os.path.join(tmp, "o")
+        rc = browser_bridge.run(args, Driver())
     eq("a navigation timeout exits 5, not 3", rc, EXIT_REMOTE_API_ERROR)
 
 
@@ -1496,6 +1499,610 @@ def test_no_site_specific_drift_from_a_sibling_repo():
                     errors="replace").read().lower()
         for word in foreign:
             check("%s is free of %r" % (name, word), word not in text)
+
+
+# ---------------------------------------------------------------------------
+# Run outcomes, output files and the paid rung — added 2026-10-14
+# ---------------------------------------------------------------------------
+
+LISTING_URL = "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7"
+
+
+class _BridgeArgs:
+    """The browser engines' parsed flags, for driving browser_bridge.run."""
+
+    def __init__(self, out, **overrides):
+        self.mode = "category"
+        self.url = LISTING_URL
+        self.pages = 2
+        self.category = None
+        self.max_products = None
+        self.delay = 0
+        self.timeout = 1
+        self.format = "both"
+        self.out = out
+        self.allow_empty = False
+        self.dump_html = None
+        self.verbose = False
+        self.solve_captcha = "when-blocked"
+        self.twocaptcha_key = None
+        self.captcha_api = "v2"
+        self.min_score = 0.7
+        self.headless = True
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+class _PageDriver:
+    """A fake browser serving `pages[n]` for page n (1-based). A value that is
+    an exception instance is raised from navigate()."""
+
+    name = "fake"
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.current = ""
+        self.visits = 0
+
+    def start(self):
+        pass
+
+    def navigate(self, url):
+        self.visits += 1
+        page = self.pages[min(self.visits, len(self.pages)) - 1]
+        if isinstance(page, Exception):
+            raise page
+        self.current = page
+        return 200
+
+    def content(self):
+        return self.current
+
+    def count(self, selector):
+        return 50 if self.current else 0
+
+    def attr(self, selector, name):
+        return None
+
+    def sleep(self, ms):
+        pass
+
+    def stop(self):
+        pass
+
+
+def _quiet(fn, *args, **kwargs):
+    """Call `fn` with stdout/stderr captured; returns (result, text)."""
+    import contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        result = fn(*args, **kwargs)
+    return result, out.getvalue()
+
+
+def test_finish_run_exit_matrix():
+    """0 rows means three different things, and an unknown reason must not
+    read as "the catalogue is empty"."""
+    import output_writer as O
+    row = O.Product(sku="1", title="t", price=1.0, currency="USD")
+    cases = (
+        ([], False, "transport_failed", O.EXIT_REMOTE_API_ERROR),
+        ([], False, "parser_found_nothing", O.EXIT_REMOTE_API_ERROR),
+        ([], False, "a_reason_nobody_added_yet", O.EXIT_REMOTE_API_ERROR),
+        ([], True, "blocked", O.EXIT_BLOCKED),
+        ([], False, "hub_not_a_listing", O.EXIT_NO_PRODUCTS),
+        ([], False, "no_new_products", O.EXIT_NO_PRODUCTS),
+        ([row], False, "transport_failed", O.EXIT_PARTIAL),
+        ([row], False, "completed", 0),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (rows, blocked, reason, want) in enumerate(cases):
+            rc, _ = _quiet(O.finish_run, rows, os.path.join(tmp, "r%d" % i),
+                           "json", False, blocked=blocked, stop_reason=reason,
+                           pages_requested=2, pages_completed=1,
+                           start_url="u", final_url="u")
+            eq("finish_run(%d rows, %s) exit" % (len(rows), reason), rc, want)
+
+
+def test_a_transport_fault_after_rows_keeps_the_rows():
+    """Page 1 served, page 2 timed out: the rows of page 1 are written and the
+    run is partial (6), with the attempt sidecar beside them."""
+    import browser_bridge
+    import output_writer as O
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "o")
+        driver = _PageDriver([fixture("listing_mitersaws.html"),
+                              TimeoutError("Page.goto: Timeout exceeded")])
+        rc, _ = _quiet(browser_bridge.run, _BridgeArgs(out), driver)
+        eq("transport fault after rows exits 6", rc, O.EXIT_PARTIAL)
+        check("page 1's rows were written", os.path.exists(out + ".json"))
+        rows = json.load(open(out + ".json")) if os.path.exists(out + ".json") else []
+        eq("all four page-1 rows kept", len(rows), 4)
+        attempt = out + O.ATTEMPT_META_SUFFIX
+        check("attempt sidecar written", os.path.exists(attempt))
+        if os.path.exists(attempt):
+            meta = json.load(open(attempt))
+            eq("stop reason names the transport", meta["stop_reason"],
+               "transport_failed")
+            eq("page 2 recorded as failed", meta["pages_failed"], [2])
+            eq("scope carries the store", meta["scope"]["store_id"], "121")
+
+
+def test_an_empty_document_is_not_a_block():
+    """39 bytes with none of the site's assets is a navigation that produced
+    nothing — not Akamai's refusal (which is ~370 bytes)."""
+    import browser_bridge
+    import output_writer as O
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = _PageDriver(["<html><head></head><body></body></html>"])
+        rc, text = _quiet(browser_bridge.run,
+                          _BridgeArgs(os.path.join(tmp, "o"), pages=1), driver)
+        eq("an empty document exits 5, not 3", rc, O.EXIT_REMOTE_API_ERROR)
+        check("the message says the document was empty",
+              "EMPTY document" in text, "(got %r)" % text[-200:])
+
+
+def test_a_listing_that_parses_to_nothing_is_a_parser_failure():
+    import browser_bridge
+    import output_writer as O
+    import product_parser as P
+    original = P.parse_category
+    P.parse_category = lambda *a, **k: []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = _PageDriver([fixture("listing_mitersaws.html")])
+            rc, text = _quiet(browser_bridge.run,
+                              _BridgeArgs(os.path.join(tmp, "o"), pages=1),
+                              driver)
+            meta = json.load(open(os.path.join(tmp, "o") + O.ATTEMPT_META_SUFFIX))
+    finally:
+        P.parse_category = original
+    eq("a served grid parsed to 0 rows exits 5, not 4", rc,
+       O.EXIT_REMOTE_API_ERROR)
+    eq("and says why", meta["stop_reason"], "parser_found_nothing")
+
+
+def test_usage_errors_exit_2():
+    import browser_bridge
+    import http_scraper
+    def run(url):
+        # A string SystemExit is exit 1 to the shell, so it is caught and
+        # read rather than allowed to end the suite.
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                return _quiet(browser_bridge.run,
+                              _BridgeArgs(os.path.join(tmp, "o"), url=url),
+                              _PageDriver([""]))[0]
+        except SystemExit as exc:
+            return exc.code if isinstance(exc.code, int) else 1
+
+    eq("browser engine: a foreign host is exit 2",
+       run("https://www.homedepot.ca/b/x"), 2)
+    eq("browser engine: no URL is exit 2", run(None), 2)
+    for argv in (["--url", "https://www.homedepot.ca/x"], []):
+        code = None
+        try:
+            _quiet(http_scraper.parse_args, argv)
+        except SystemExit as exc:
+            code = exc.code
+        eq("http engine: %r is exit 2" % (argv,), code, 2)
+
+
+def test_a_typed_category_url_beats_the_env_file():
+    import http_scraper
+    saved = os.environ.get("HOMEDEPOT_URL")
+    os.environ["HOMEDEPOT_URL"] = "https://www.homedepot.com/b/From-Env/N-1"
+    try:
+        args = http_scraper.parse_args(
+            ["--category-url", "https://www.homedepot.com/b/Typed/N-2"])
+    finally:
+        if saved is None:
+            os.environ.pop("HOMEDEPOT_URL", None)
+        else:
+            os.environ["HOMEDEPOT_URL"] = saved
+    eq("typed --category-url wins", args.url,
+       "https://www.homedepot.com/b/Typed/N-2")
+
+
+def _http_run(get, tmp, pages="2"):
+    import http_scraper
+    original = http_scraper.build_session
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            return get(url)
+
+    session = Session()
+    http_scraper.build_session = lambda *a, **k: session
+    try:
+        rc, text = _quiet(http_scraper.main, [
+            "--url", LISTING_URL, "--pages", pages, "--retries", "1",
+            "--retry-delay", "0", "--delay", "0", "--format", "json",
+            "--out", os.path.join(tmp, "o")])
+    finally:
+        http_scraper.build_session = original
+    return rc, session.calls, text
+
+
+class _Resp:
+    def __init__(self, status, text):
+        self.status_code = status
+        self.text = text
+        self.url = LISTING_URL
+        self.headers = {}
+
+
+def test_http_transport_failure_is_not_a_block():
+    import output_writer as O
+
+    def dead(url):
+        raise ConnectionError("Connection reset by peer")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rc, calls, _ = _http_run(dead, tmp)
+        eq("http: no answer at all exits 5, not 3", rc, O.EXIT_REMOTE_API_ERROR)
+        meta = json.load(open(os.path.join(tmp, "o") + O.ATTEMPT_META_SUFFIX))
+        eq("http: stop reason", meta["stop_reason"], "transport_failed")
+
+    listing = fixture("listing_mitersaws.html")
+
+    def second_page_dies(url):
+        if "Nao=" not in url:
+            return _Resp(200, listing)
+        raise ConnectionError("Connection reset by peer")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rc, _, _ = _http_run(second_page_dies, tmp)
+        eq("http: rows then a dead connection exits 6", rc, O.EXIT_PARTIAL)
+
+
+def test_http_does_not_ask_a_refusing_exit_again():
+    import output_writer as O
+    blocked = fixture("blocked_access_denied.html")
+    with tempfile.TemporaryDirectory() as tmp:
+        rc, calls, _ = _http_run(lambda url: _Resp(403, blocked), tmp, pages="1")
+    eq("http: a 403 with no other exit is blocked", rc, O.EXIT_BLOCKED)
+    eq("http: and the same exit is not asked again", calls, 1)
+
+
+def test_output_modes_follow_the_umask():
+    """mkstemp creates 0600 and os.replace keeps it; the writer must not."""
+    import output_writer as O
+    import stat
+    if os.name != "posix":
+        SKIPS.append("output modes (not posix)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        for umask, want in ((0o022, 0o644), (0o002, 0o664), (0o077, 0o600)):
+            path = os.path.join(tmp, "m%o.json" % umask)
+            old = os.umask(umask)
+            try:
+                O._atomic_write(path, "x")
+            finally:
+                os.umask(old)
+            eq("new file under umask %03o" % umask,
+               oct(stat.S_IMODE(os.stat(path).st_mode)), oct(want))
+        path = os.path.join(tmp, "existing.json")
+        open(path, "w").write("old")
+        os.chmod(path, 0o640)
+        O._atomic_write(path, "new")
+        eq("an existing file keeps its mode",
+           oct(stat.S_IMODE(os.stat(path).st_mode)), oct(0o640))
+
+
+def test_csv_formula_cells_are_neutralised():
+    import csv as _csv
+    import output_writer as O
+    rows = [O.Product(sku="1", title='=HYPERLINK("http://x","y")',
+                      brand="@SUM(A1)", badges=["-2+3", "ok"], price=-5.0,
+                      store_quantity=-1, currency="USD")]
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "o")
+        _quiet(O.finish_run, rows, prefix, "both", False, blocked=False,
+               stop_reason="completed", pages_requested=1, pages_completed=1,
+               start_url="u", final_url="u", extra={"csv_cells_escaped": "caller"})
+        got = list(_csv.DictReader(open(prefix + ".csv", newline="")))[0]
+        eq("formula title escaped", got["title"], "'=HYPERLINK(\"http://x\",\"y\")")
+        eq("formula brand escaped", got["brand"], "'@SUM(A1)")
+        eq("a joined list is escaped after the join", got["badges"], "'-2+3 | ok")
+        eq("a negative NUMBER is untouched", got["price"], "-5.0")
+        data = json.load(open(prefix + ".json"))[0]
+        eq("JSON keeps the site's bytes", data["title"], '=HYPERLINK("http://x","y")')
+        meta = json.load(open(prefix + ".meta.json"))
+        eq("sidecar declares the escaped count", meta["csv_cells_escaped"], 3)
+        eq("caller's own extra is not overwritten",
+           meta["transport_facts"]["csv_cells_escaped"], "caller")
+
+
+class _SolverStub:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, challenge, key, **kwargs):
+        self.calls += 1
+        return "TOKEN-%d" % self.calls
+
+
+CAPTCHA_PAGE = ('<html><body><div class="g-recaptcha" data-sitekey="'
+                '6LfakeSitekeyForTheOfflineSuite00000000000"></div>'
+                '<script>grecaptcha.render("x", {});</script></body></html>')
+
+
+class _CaptchaDriver(_PageDriver):
+    def __init__(self, html, inject=True, enterprise=False):
+        super().__init__([html])
+        self.current = html
+        self.injected = []
+        self.enterprise = enterprise
+        if not inject:
+            self.inject_captcha_token = None
+
+    def recaptcha_discovery(self):
+        return {"found": True, "sitekey": "6LfakeSitekeyForTheOfflineSuite00000000000",
+                "size": "normal", "enterprise": self.enterprise, "hints": []}
+
+    def inject_captcha_token(self, token):
+        self.injected.append(token)
+        return True
+
+
+def test_the_paid_rung_is_wired_and_budgeted():
+    """The rung used to call a function that does not exist, and the error was
+    swallowed. With the solver stubbed (nothing is ever sent anywhere): one
+    purchase per page, the token is injected, and nothing is bought that
+    could not be used."""
+    import browser_bridge
+    import captcha_solver
+    import page_flow
+    stub = _SolverStub()
+    original = captcha_solver.solve_recaptcha
+    captcha_solver.solve_recaptcha = stub
+    try:
+        args = _BridgeArgs("unused", twocaptcha_key="KEY-NOT-REAL")
+        budget = page_flow.SolveBudget()
+        driver = _CaptchaDriver(CAPTCHA_PAGE)
+        _quiet(browser_bridge.solve_if_captcha, driver, args, LISTING_URL,
+               CAPTCHA_PAGE, budget=budget)
+        eq("one solve bought", stub.calls, 1)
+        eq("and its token injected", driver.injected, ["TOKEN-1"])
+        # A second detection on the SAME page: the allowance is spent.
+        _quiet(browser_bridge.solve_if_captcha, driver, args, LISTING_URL,
+               CAPTCHA_PAGE, budget=budget)
+        eq("the page's allowance is not exceeded", stub.calls,
+           page_flow.SOLVES_PER_PAGE)
+        # Nothing bought when the token could not be used.
+        before = stub.calls
+        _quiet(browser_bridge.solve_if_captcha, _CaptchaDriver(CAPTCHA_PAGE,
+               inject=False), args, LISTING_URL, CAPTCHA_PAGE)
+        _quiet(browser_bridge.solve_if_captcha, _CaptchaDriver(CAPTCHA_PAGE,
+               enterprise=True), args, LISTING_URL, CAPTCHA_PAGE)
+        _quiet(browser_bridge.solve_if_captcha, _CaptchaDriver(CAPTCHA_PAGE),
+               _BridgeArgs("unused"), LISTING_URL, CAPTCHA_PAGE)
+        eq("no purchase without injection, for Enterprise, or without a key",
+           stub.calls, before)
+        # fetch_page owns the allowance: one page, one purchase, even though
+        # the captcha is still there after the solve.
+        stub.calls = 0
+        result = _quiet(browser_bridge.fetch_page, _CaptchaDriver(CAPTCHA_PAGE),
+                        args, LISTING_URL)[0]
+        eq("fetch_page buys at most one solve per page", stub.calls, 1)
+        eq("and reports it", result["solves_bought"], 1)
+    finally:
+        captcha_solver.solve_recaptcha = original
+
+
+def test_shared_module_attributes_exist():
+    """Every `module.attr` used on a LOCAL module from the engines and the
+    shared code must exist. `captcha_solver.solve_on_page` did not, and a
+    broad `except` turned the AttributeError into a warning nobody read."""
+    local = {os.path.splitext(n)[0] for n in os.listdir(HERE)
+             if n.endswith(".py")}
+    callers = ("browser_bridge.py", "http_scraper.py", "scraper_api_client.py",
+               "playwright_scraper.py", "puppeteer_scraper.py",
+               "selenium_scraper.py", "diff_runs.py", "catalog_walk.py")
+    import importlib
+    checked = 0
+    for name in callers:
+        tree = ast.parse(open(os.path.join(HERE, name), encoding="utf-8").read())
+        aliases = {}
+        bound = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name in local:
+                        aliases[a.asname or a.name] = a.name
+            elif isinstance(node, ast.arg):
+                bound.add(node.arg)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in aliases
+                    and node.value.id not in bound):
+                module = importlib.import_module(aliases[node.value.id])
+                checked += 1
+                check("%s: %s.%s exists" % (name, node.value.id, node.attr),
+                      hasattr(module, node.attr))
+    check("the attribute check bound something", checked > 20,
+          "(only %d)" % checked)
+
+
+def test_page_flow_has_no_unread_policy():
+    """A policy function nothing outside page_flow calls decides nothing."""
+    import page_flow
+    others = ""
+    for name in os.listdir(HERE):
+        if name.endswith(".py") and name not in ("page_flow.py", "smoke_test.py"):
+            others += open(os.path.join(HERE, name), encoding="utf-8").read()
+    for name, value in vars(page_flow).items():
+        if name.startswith("_") or not callable(value):
+            continue
+        if getattr(value, "__module__", None) != "page_flow":
+            continue
+        check("page_flow.%s has a reader outside page_flow" % name,
+              ("page_flow.%s" % name) in others)
+
+
+def test_scraper_api_reads_http_code_and_masks_debug():
+    import logging
+    import scraper_api_client as S
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, verdict):
+            self.verdict = verdict
+            self.headers = {"x-debug": "proxy=http://someuser:SECRETPW@1.2.3.4:80 key=abc123"}
+
+        def json(self):
+            return {"status": self.verdict, "http_code": 403,
+                    "body": fixture("blocked_access_denied.html"), "headers": {}}
+
+    class Args:
+        timeout = 30; country = "us"; cdp_endpoint = None
+        twocaptcha_key = "KEY-NOT-REAL"
+
+    original = S.requests.post
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Grab()
+    S.logger.addHandler(handler)
+    S.logger.setLevel(logging.INFO)
+    try:
+        for verdict in ("ok", "warn"):
+            S.requests.post = lambda *a, **k: Response(verdict)
+            got = S.fetch_one(Args(), LISTING_URL)
+            eq("api verdict %r: target status comes from http_code" % verdict,
+               got.status, 403)
+    finally:
+        S.requests.post = original
+        S.logger.removeHandler(handler)
+    text = " ".join(records)
+    check("x-debug is logged masked", "SECRETPW" not in text and "abc123" not in text,
+          "(got %r)" % text[:200])
+
+
+def test_diff_runs_tracks_this_sites_columns_and_refuses_another_store():
+    import dataclasses as dc
+    import diff_runs
+    import output_writer as O
+    names = {f.name for f in dc.fields(O.Product)}
+    for field in diff_runs.TRACKED_FIELDS:
+        check("diff_runs tracks a real column: %s" % field, field in names)
+    rows = json.load(open(os.path.join(HERE, "sample_output.json")))
+    changed = [dict(r) for r in rows]
+    changed[0]["store_quantity"] = (changed[0].get("store_quantity") or 0) + 5
+    result = diff_runs.diff_rows(rows, changed)
+    check("a store stock change is reported",
+          any("store_quantity" in c["changes"] for c in result["changed"]))
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for label, store in (("old", "121"), ("new", "999")):
+            path = os.path.join(tmp, label + ".json")
+            json.dump([dict(r, store_id=store) for r in rows], open(path, "w"))
+            json.dump({"status": "complete", "mode": "category",
+                       "scope": {"store_id": store}},
+                      open(os.path.join(tmp, label + ".meta.json"), "w"))
+            paths.append(path)
+
+        class Args:
+            old, new = paths
+
+        ok, _ = _quiet(diff_runs._check_comparable, Args())
+        check("two different stores are refused", ok is False)
+
+
+def test_worktree_scan_reads_untracked_files_and_skips_virtualenvs():
+    """Run the real scanner in a throwaway repository: an untracked,
+    not-ignored file holding a key shape is reported; one inside a directory
+    holding pyvenv.cfg (whatever it is called) is not."""
+    import shutil
+    import subprocess
+    if shutil.which("git") is None:
+        SKIPS.append("worktree scan (git unavailable)")
+        return
+    key = "a" * 32
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "tools"))
+        shutil.copy(os.path.join(HERE, "tools", "scan_secrets.py"),
+                    os.path.join(tmp, "tools", "scan_secrets.py"))
+        subprocess.run(["git", "init", "-q", tmp], check=True)
+        open(os.path.join(tmp, "tracked.py"), "w").write("X = 1\n")
+        subprocess.run(["git", "-C", tmp, "add", "tracked.py"], check=True)
+        os.makedirs(os.path.join(tmp, "myenv", "lib"))
+        open(os.path.join(tmp, "myenv", "pyvenv.cfg"), "w").write("home = /usr\n")
+        open(os.path.join(tmp, "myenv", "lib", "vendored.py"), "w").write("# %s\n" % key)
+        scan = [sys.executable, os.path.join(tmp, "tools", "scan_secrets.py"),
+                "--worktree"]
+        clean = subprocess.run(scan, capture_output=True, text=True, cwd=tmp)
+        eq("a virtualenv by pyvenv.cfg is skipped", clean.returncode, 0)
+        open(os.path.join(tmp, "scratch.py"), "w").write("KEY = '%s'\n" % key)
+        dirty = subprocess.run(scan, capture_output=True, text=True, cwd=tmp)
+        eq("an untracked file with a key shape is reported", dirty.returncode, 1)
+        check("the scan says how many files it read",
+              "file(s) read" in dirty.stdout, "(got %r)" % dirty.stdout[:200])
+
+
+def _tracked_text_files():
+    import subprocess
+    try:
+        names = subprocess.run(["git", "ls-files", "-z"], cwd=HERE,
+                               capture_output=True, text=True).stdout.split("\0")
+    except OSError:
+        names = []
+    names = [n for n in names if n]
+    if not names:
+        for root, dirs, files in os.walk(HERE):
+            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")
+                       and not os.path.exists(os.path.join(root, d, "pyvenv.cfg"))]
+            names += [os.path.relpath(os.path.join(root, f), HERE) for f in files]
+    return [n for n in names
+            if not n.startswith("fixtures/") and not n.endswith((".png", ".gz"))]
+
+
+def test_no_private_citations_in_shipped_files():
+    """Public files state their rules in their own words. Tokens assembled
+    from pieces so this file does not match itself."""
+    import re
+    banned = re.compile("|".join([
+        re.escape("CLAUDE" + ".md"), "§" + r"\s?\d", "claude" + "_2scraper",
+        "2scraper" + "_repo_rules", "play" + r"book\s*§"]), re.I)
+    found = []
+    for name in _tracked_text_files():
+        try:
+            text = open(os.path.join(HERE, name), encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if banned.search(text):
+            found.append(name)
+    eq("no tracked file cites a private instruction file", found, [])
+
+
+def test_no_other_sites_vocabulary_in_any_shipped_file():
+    """Extends the .py-only drift check to every tracked text file: contributor
+    docs, issue templates, ignore files and requirements headers too."""
+    words = ("bersh" + "ka", "indi" + "tex", "itx" + "rest", "women" + ".html",
+             "max" + "-grids", "max" + "_grids")
+    found = []
+    for name in _tracked_text_files():
+        if name == "smoke_test.py":
+            continue
+        try:
+            text = open(os.path.join(HERE, name), encoding="utf-8").read().lower()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for word in words:
+            if word in text:
+                found.append("%s: %s" % (name, word))
+    eq("no tracked file carries another site's vocabulary", found, [])
 
 
 def main():

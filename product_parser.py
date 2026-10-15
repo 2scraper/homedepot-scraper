@@ -2,7 +2,7 @@
 
 Everything site-specific in this repo lives here and in a dozen named
 constants in the engines. If you are writing Home Depot knowledge anywhere
-else, move it here (family CLAUDE.md §1).
+else, move it here.
 
 Three page kinds, and they are not interchangeable
 --------------------------------------------------
@@ -65,7 +65,7 @@ BASE_URL = "https://www.homedepot.com"
 # separate businesses on separate platforms with a different page shape. They
 # are NOT supported here, and `supported_host` refuses them WITH THE REASON
 # rather than with "not a Home Depot site", which would be false and would send
-# the reader looking for a typo (family CLAUDE.md §5).
+# the reader looking for a typo.
 HOSTS = ("www.homedepot.com", "homedepot.com")
 UNSUPPORTED_HOSTS = {
     "www.homedepot.ca": "homedepot.ca is Home Depot Canada, a separate "
@@ -115,8 +115,7 @@ BOT_CHALLENGE_MARKERS = (
     # seven impersonation profiles) while system curl got 200 from the same
     # exit in the same minute.
     #
-    # This is the a sibling repo lesson in this family's CLAUDE.md §8: the shop's
-    # own error page under 403, with NO vendor marker in the body at all —
+    # The shop's own error page under 403, with NO vendor marker in the body at all —
     # no Akamai name, no reference number, nothing. The status is the primary
     # signal, and these markers are the secondary one for Selenium and
     # pyppeteer, which have no response object to ask.
@@ -179,8 +178,7 @@ CAPTCHA_MARKERS = (
 
 # The site references its own asset hosts on every page it actually serves.
 # Neither the 403 nor an interstitial does. This is the STRUCTURAL secondary
-# signal the family asks for where a status code is not available (CLAUDE.md
-# §8): a served page is built out of the site's own assets, an interstitial is
+# signal for where a status code is not available: a served page is built out of the site's own assets, an interstitial is
 # not. Measured 2026-09-22: 40+ matches on every real page, 0 on the 403.
 OWN_ASSET_HOSTS = (
     "assets.thdstatic.com",
@@ -194,7 +192,7 @@ OWN_ASSET_HOSTS = (
 # contains nothing that extension injects, so this guard is currently
 # BELT-AND-BRACES rather than load-bearing — it is here because the marker set
 # is the thing most likely to be broadened later, and the family has already
-# paid for that lesson once (CLAUDE.md §8).
+# paid for that lesson once.
 _EXTENSION_SCRIPT_RE = re.compile(
     r"<script[^>]+src=[\"'](?:chrome|moz)-extension://[^\"']*[\"'][^>]*>\s*</script>",
     re.I,
@@ -337,7 +335,7 @@ def search_model(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     returned 24 rows for the hub `/b/Tools/N-5yc1vZc1xy` and 22 for the
     HOME PAGE, each labelled with whatever category the caller asked for.
     Every one of those rows was real product data attached to the wrong
-    question — the family's "junk-link data theft" failure (CLAUDE.md §4) in
+    question — the family's "junk-link data theft" failure in
     its Apollo form.
 
     So a page is a listing only when a model says `contentType: "plppage"`,
@@ -363,7 +361,7 @@ def search_report(state: Dict[str, Any]) -> Dict[str, Any]:
     NOTE `totalProducts` is LIVE INVENTORY, not a stable count: it moved
     144 -> 143 between two requests four minutes apart on 2026-09-22. It is
     reported in the sidecar and is never used to decide when to stop
-    (CLAUDE.md §7 layer 3 — terminate on "this page added no new sku").
+    (the run terminates on "this page added no new sku").
     """
     model = search_model(state) or {}
     report = model.get("searchReport")
@@ -502,7 +500,7 @@ def _number(value: Any) -> Optional[float]:
     The Apollo payload types prices as JSON numbers, so there is no grouping
     convention to decode here and deliberately no general price-text parser:
     this repo never reads a price off rendered text, so a parser for
-    `1.234,56` would be dead code that looks load-bearing (CLAUDE.md §4).
+    `1.234,56` would be dead code that looks load-bearing.
     The one string case that does occur is the JSON-LD `price`, which
     schema.org allows as a string.
     """
@@ -722,7 +720,7 @@ def _flatten_jsonld(doc: Any) -> Iterable[Dict[str, Any]]:
     """Every node in a JSON-LD document, covering the three legal shapes.
 
     A dict, a list of dicts, and a `@graph` wrapper are all valid schema.org
-    and the family has been bitten by each (CLAUDE.md §4). A PDP capture on
+    and the family has been bitten by each. A PDP capture on
     2026-09-22 held three top-level blocks, one of them a bare list.
     """
     if isinstance(doc, dict):
@@ -759,7 +757,7 @@ def _first_offer(node: Dict[str, Any]) -> Dict[str, Any]:
 
     `"offers": null` is an EXPLICIT null, so a `.get("offers", {})` default
     does not apply — that is the exact shape that raised `AttributeError` in
-    a sibling repo (CLAUDE.md §4).
+    a sibling repo.
     """
     offers = node.get("offers")
     if isinstance(offers, dict):
@@ -898,7 +896,7 @@ def detect_page_state(html: str, *, status: Optional[int] = None,
        because the body carries no vendor name at all — just "Access Denied"
        and an `errors.edgesuite.net` link. The asset-host count is the
        structural secondary signal for the engines that have no response
-       object to ask (CLAUDE.md §8).
+       object to ask.
     5. A **hub** is a 200 that carries an Apollo state and no listing model.
        Structurally different from a leaf that returned zero rows, and the two
        want different answers: a hub is a correct response to a URL that was

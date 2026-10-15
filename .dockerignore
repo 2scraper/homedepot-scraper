@@ -16,7 +16,6 @@ __pycache__/
 .venv/
 venv/
 env/
-bershka_products.*
 canary_run.*
 *_debug.html
 *_debug.png

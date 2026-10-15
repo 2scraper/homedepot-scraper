@@ -20,6 +20,7 @@ import asyncio
 import sys
 
 import browser_bridge
+import captcha_solver
 import proxy_pool
 
 # Module level — see selenium_scraper.py.
@@ -94,6 +95,16 @@ class PuppeteerDriver:
                 "(el, n) => el.getAttribute(n)", node, name))
         except Exception:
             return None
+
+    # The paid captcha rung's two page operations. pyppeteer evaluates an
+    # arrow function and passes extra arguments to it.
+    def recaptcha_discovery(self):
+        return self._run(self._page.evaluate(
+            captcha_solver.RECAPTCHA_DISCOVERY_JS))
+
+    def inject_captcha_token(self, token):
+        return bool(self._run(self._page.evaluate(
+            captcha_solver.INJECT_TOKEN_JS, token)))
 
     def sleep(self, ms):
         self._run(asyncio.sleep(ms / 1000.0))

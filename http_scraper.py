@@ -58,7 +58,7 @@ import output_writer
 import page_flow
 import product_parser as P
 import proxy_pool
-from output_writer import (EXIT_BLOCKED, EXIT_NO_PRODUCTS, Product, finish_run)
+from output_writer import Product, finish_run
 
 try:
     import requests
@@ -74,7 +74,7 @@ DEFAULT_OUT = "homedepot_products"
 # ones Akamai actually scores.
 #
 # The user agent is a literal here and that is a deliberate exception to the
-# family rule "the UA comes from the browser, not a literal" (CLAUDE.md §8):
+# family rule "the UA comes from the browser, not a literal":
 # there is no browser in this transport to ask. It is kept consistent with the
 # `sec-ch-ua` version below, because a Chrome 140 UA beside a Chrome 133 client
 # hint is itself a mismatch — if you bump one, bump both.
@@ -293,7 +293,7 @@ def fetch(session, url: str, timeout: int, *, retries: int = 2,
     A `requests` exception message contains the FULL URL including its query
     string, and a ProxyError names the proxy URL — password included. So
     everything that reaches a log or an exception here goes through
-    `_mask_text` first (CLAUDE.md §8).
+    `_mask_text` first.
     """
     started = time.time()
     last: Optional[FetchResult] = None
@@ -327,12 +327,16 @@ def fetch(session, url: str, timeout: int, *, retries: int = 2,
             if log:
                 log("  attempt %d/%d: %s (HTTP %s, %d bytes)"
                     % (attempt, attempts, state, last.status, len(last.html)))
-            if page_flow.should_rotate_exit(state) and rotate is not None:
-                rotated = rotate()
-                if rotated is not None:
-                    session, exit_label = rotated
-                    if log:
-                        log("  rotating exit -> %s" % exit_label)
+            if page_flow.should_rotate_exit(state):
+                # A decision about the ADDRESS: asking the same exit again
+                # only repeats the question. With no other exit to move to,
+                # the answer is final.
+                rotated = rotate() if rotate is not None else None
+                if rotated is None:
+                    return last
+                session, exit_label = rotated
+                if log:
+                    log("  rotating exit -> %s" % exit_label)
         if attempt < attempts:
             time.sleep(retry_delay)
     return last  # type: ignore[return-value]
@@ -358,10 +362,7 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
               "set HOMEDEPOT_PROXY in .env to a US exit.", file=sys.stderr)
     session = build_session(proxy, args.http_client)
 
-    url = args.url or _url_from_args(args)
-    ok, reason = P.supported_host(url)
-    if not ok:
-        raise SystemExit("refusing %s: %s" % (url, reason))
+    url = args.url
 
     facts: Dict[str, Any] = {
         "transport": "http",
@@ -374,6 +375,8 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
         "store_name": None,
         "total_products_reported": None,
         "blocked": False,
+        "transport_error": None,
+        "stop_reason": None,
         "rotations": 0,
         "start_url": url,
         "final_url": url,
@@ -391,8 +394,8 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
 
         A fresh SESSION, not just a different proxy on the old one: cookies
         Akamai issued against exit A and replayed from exit B are a stronger
-        signal than either address alone (CLAUDE.md §8, "a rotation is a
-        fresh browser" — the same argument applies to a cookie jar).
+        signal than either address alone (a rotation is a fresh browser, and
+        the same argument applies to a cookie jar).
         """
         if pool is None or len(pool) < 2:
             return None
@@ -405,10 +408,24 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
         facts["rotations"] = state_box["rotations"]
         return state_box["session"], proxy_pool.mask(nxt)
 
+    def get(target: str, page: int) -> Optional[FetchResult]:
+        """`fetch`, with a refused PROXY credential ending the run here rather
+        than unwinding past the rows already gathered."""
+        try:
+            return fetch(state_box["session"], target, args.timeout,
+                         retries=args.retries, retry_delay=args.retry_delay,
+                         log=log, rotate=rotate)
+        except ProxyAuthError as exc:
+            print(PROXY_AUTH_MESSAGE % exc, file=sys.stderr)
+            facts["transport_error"] = "proxy refused the credential"
+            facts["failed_pages"].append(page)
+            facts["stop_reason"] = "proxy_auth_failed"
+            return None
+
     if mode == "product":
-        result = fetch(state_box["session"], url, args.timeout,
-                       retries=args.retries, retry_delay=args.retry_delay,
-                       log=log, rotate=rotate)
+        result = get(url, 1)
+        if result is None or _transport_failed(result, facts, 1):
+            return rows, facts
         facts["states"].append(result.state)
         _dump(args, result.html, 1)
         if page_flow.counts_as_blocked(result.state):
@@ -418,14 +435,16 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
         rows = P.parse_product(result.html, url=result.final_url,
                                category=args.category)
         facts["pages_completed"] = 1
+        if result.state == "product" and not rows:
+            facts["stop_reason"] = "parser_found_nothing"
         return rows, facts
 
     for page in range(1, args.pages + 1):
         page_target = P.page_url(url, page)
         log("page %d: %s" % (page, page_target))
-        result = fetch(state_box["session"], page_target, args.timeout,
-                       retries=args.retries, retry_delay=args.retry_delay,
-                       log=log, rotate=rotate)
+        result = get(page_target, page)
+        if result is None or _transport_failed(result, facts, page):
+            break
         state = result.state
         facts["states"].append(state)
         _dump(args, result.html, page)
@@ -463,6 +482,15 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
             row.page = page
         fresh = output_writer.dedupe_by_sku(page_rows, seen)
         rows.extend(fresh)
+        if state == "content" and not page_rows:
+            # The classifier found listing products on this page and the
+            # parser returned none: our bug, not an empty category.
+            print("page %d: the page holds a listing grid but parsed to 0 "
+                  "rows — a parser failure, not an empty category." % page,
+                  file=sys.stderr)
+            facts["failed_pages"].append(page)
+            facts["stop_reason"] = "parser_found_nothing"
+            break
         facts["pages_completed"] = page
 
         log("  %s: %d rows (%d new, %d total)"
@@ -470,7 +498,7 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
 
         # The terminating condition is DATA, never a selector and never
         # arithmetic over `totalProducts` — that figure is live inventory and
-        # was measured moving 144 -> 143 inside four minutes (CLAUDE.md §7).
+        # was measured moving 144 -> 143 inside four minutes.
         if not page_rows:
             log("  page %d added no products — end of listing." % page)
             break
@@ -486,12 +514,28 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
     return rows, facts
 
 
+def _transport_failed(result: "FetchResult", facts: Dict[str, Any],
+                      page: int) -> bool:
+    """Every attempt raised (a timeout, a reset, a dead exit): the site never
+    answered. That is not a block — exit 3 would send the reader after the
+    anti-bot problem — so it ends the run as "content never obtained" (5),
+    or as partial (6) when earlier pages already gave rows."""
+    if result.status is not None or not result.error:
+        return False
+    print("page %d: no answer from the site after %d attempt(s): %s"
+          % (page, result.attempts, result.error), file=sys.stderr)
+    facts["transport_error"] = result.error
+    facts["failed_pages"].append(page)
+    facts["stop_reason"] = "transport_failed"
+    return True
+
+
 def _dump(args, html: str, page: int) -> None:
     """`--dump-html` writes on SUCCESS too, not only on failure.
 
     A run can return the right count with a field silently unpopulated, and
     then the exact bytes are the only way to tell a parsing bug from a page
-    that genuinely did not carry the field (CLAUDE.md §9).
+    that genuinely did not carry the field.
     """
     if not getattr(args, "dump_html", None):
         return
@@ -506,15 +550,6 @@ def _dump(args, html: str, page: int) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
-
-
-def _url_from_args(args) -> str:
-    if args.category_url:
-        return args.category_url
-    raise SystemExit(
-        "nothing to fetch: pass --url, or --category-url with a leaf "
-        "category address such as "
-        "https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7")
 
 
 def parse_args(argv=None):
@@ -569,9 +604,22 @@ def parse_args(argv=None):
                    help="How many times a refused or challenged page may move "
                         "to a different exit before the run gives up.")
     args = p.parse_args(argv)
+    # What the user TYPED wins over .env. env_config.apply fills only unset
+    # values, so after it runs a HOMEDEPOT_URL from .env would sit in
+    # `args.url` and silently beat a typed --category-url. Capture first.
+    typed_url = args.url or args.category_url
     env_config.apply(args)
-    if args.category_url and not args.url:
+    if typed_url:
+        args.url = typed_url
+    elif args.category_url:
         args.url = args.category_url
+    if not args.url:
+        p.error("nothing to fetch: pass --url, or --category-url with a leaf "
+                "category address such as https://www.homedepot.com/b/"
+                "Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7")
+    ok, reason = P.supported_host(args.url)
+    if not ok:
+        p.error("refusing %s: %s" % (args.url, reason))
     return args
 
 
@@ -597,6 +645,8 @@ def _non_negative_float(value):
 
 
 def _stop_reason(args, facts: Dict[str, Any]) -> str:
+    if facts.get("stop_reason"):
+        return facts["stop_reason"]
     if facts["blocked"]:
         return "blocked"
     if "hub" in facts.get("states", []):
@@ -608,19 +658,22 @@ def _stop_reason(args, facts: Dict[str, Any]) -> str:
     return "no_new_products"
 
 
+PROXY_AUTH_MESSAGE = (
+    "[!] the proxy refused the credential: %s\n"
+    "    This is NOT the site blocking the scraper — homedepot.com was never "
+    "reached.\n"
+    "    Check HOMEDEPOT_PROXY in .env; a rotated or expired credential fails "
+    "exactly like this,\n"
+    "    and every exit on it fails the same way, so retrying or rotating "
+    "will not help.")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
         rows, facts = scrape(args)
     except ProxyAuthError as exc:
-        print("[!] the proxy refused the credential: %s\n"
-              "    This is NOT the site blocking the scraper — homedepot.com "
-              "was never reached.\n"
-              "    Check HOMEDEPOT_PROXY in .env; a rotated or expired "
-              "credential fails exactly like this,\n"
-              "    and every exit on it fails the same way, so retrying or "
-              "rotating will not help."
-              % exc, file=sys.stderr)
+        print(PROXY_AUTH_MESSAGE % exc, file=sys.stderr)
         return output_writer.EXIT_REMOTE_API_ERROR
     except SystemExit:
         raise
@@ -639,6 +692,9 @@ def main(argv=None) -> int:
         mode=args.mode,
         start_url=facts.get("start_url", ""),
         final_url=facts.get("final_url", ""),
+        scope=output_writer.scope_fingerprint(
+            store_id=output_writer.run_store_id(facts, rows),
+            category=args.category, max_products=args.max_products),
         extra=facts,
     )
 

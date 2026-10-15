@@ -26,10 +26,11 @@ from __future__ import annotations
 import sys
 
 import browser_bridge
+import captcha_solver
 import proxy_pool
 
 # Module level, so the offline suite can tell "engine absent" from "engine
-# broken" (CLAUDE.md §10).
+# broken".
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -100,6 +101,17 @@ class SeleniumDriver:
             return node.get_attribute(name)
         except Exception:
             return None
+
+    # The paid captcha rung's two page operations. Selenium's execute_script
+    # takes a function BODY, so the arrow function is wrapped and called.
+    def recaptcha_discovery(self):
+        return self._driver.execute_script(
+            "return (%s)();" % captcha_solver.RECAPTCHA_DISCOVERY_JS.strip())
+
+    def inject_captcha_token(self, token):
+        return bool(self._driver.execute_script(
+            "return (%s)(arguments[0]);" % captcha_solver.INJECT_TOKEN_JS.strip(),
+            token))
 
     def sleep(self, ms):
         import time
