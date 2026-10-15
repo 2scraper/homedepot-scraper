@@ -12,6 +12,8 @@ violation.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-10-15
+
 > **Behaviour changes.** Exit codes: a run whose content was never obtained —
 > no answer from the site over plain HTTP, an empty document from a browser
 > navigation, a page that lists products but parsed to none — now exits **5**
@@ -236,4 +238,5 @@ separately.
 - Every measurement is from one store (121, Cumberland GA). Per-store price
   variation is real and has not been sampled.
 
+[1.1.0]: https://github.com/2scraper/homedepot-scraper/releases/tag/v1.1.0
 [1.0.0]: https://github.com/2scraper/homedepot-scraper/releases/tag/v1.0.0
