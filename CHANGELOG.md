@@ -12,6 +12,12 @@ violation.
 
 ## [Unreleased]
 
+### Changed
+
+- CI only: the canary bills a paid route (`HOMEDEPOT_PROXY` or
+  `HOMEDEPOT_CDP_ENDPOINT`), so it now runs weekly (Mondays 06:17 UTC) instead of
+  daily; a manual dispatch still runs it.
+
 ## [1.1.0] — 2026-10-15
 
 > **Behaviour changes.** Exit codes: a run whose content was never obtained —
