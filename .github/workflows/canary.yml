@@ -1,6 +1,6 @@
 name: canary
 
-# ONE real run a day against a known-good leaf category, to catch the site
+# ONE real run a week (Mondays; every run bills the proxy or Scraping Browser) against a known-good leaf category, to catch the site
 # changing its markup before a user does.
 #
 # It requests THREE pages on purpose. With one page pagination is never
@@ -21,7 +21,7 @@ name: canary
 # skipped green every day for weeks tested nothing, and its badge said it did.
 on:
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC; weekly because every run bills a paid route
   workflow_dispatch:
 
 jobs:
