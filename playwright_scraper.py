@@ -37,6 +37,7 @@ class PlaywrightDriver:
         self.args = args
         self._over_cdp = False
         self._cdp = None
+        self.media_blocked = False
         self.autosolve_armed = False
         self.autosolve_events = []
         self.autosolve_notes = []
@@ -77,6 +78,11 @@ class PlaywrightDriver:
             # Chromium is installed and claiming an older Chrome than the JS
             # engine reports is itself a mismatch.
             self._context = self._browser.new_context(locale="en-US")
+            if proxy_pool.should_block_media(self.args, proxy_in_use=bool(pool)):
+                # Images, video and fonts are aborted behind a metered proxy:
+                # no parser reads them (image URLs come from the page data).
+                self._context.route("**/*", proxy_pool.playwright_media_route)
+                self.media_blocked = True
         self._page = self._context.new_page()
         self._page.set_default_timeout(self.args.timeout * 1000)
         if self._over_cdp:

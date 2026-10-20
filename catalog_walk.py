@@ -168,6 +168,12 @@ def main(argv=None) -> int:
                         grep=args.grep, log=log):
             found.append(url)
     except RuntimeError as exc:
+        import http_scraper
+        if isinstance(exc, http_scraper.ProxyAuthError):
+            # The proxy gateway (407/402) refused: the site was never asked,
+            # so this is not a block.
+            print(http_scraper.proxy_message(exc), file=sys.stderr)
+            return 5
         print("[!] %s" % exc, file=sys.stderr)
         return 3
 

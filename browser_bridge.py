@@ -403,6 +403,27 @@ def run(args, driver) -> int:
     rows: List[Product] = []
     seen: set = set()
 
+    if not getattr(args, "cdp_endpoint", None):
+        pool = proxy_pool.from_args(args)
+        if pool:
+            # One HEAD for robots.txt through the proxy BEFORE the browser
+            # starts: a gateway 407/402 ends the run here, at exit 5. Not
+            # retried and not rotated — every exit on a refused credential or
+            # an exhausted balance answers the same way.
+            try:
+                proxy_pool.precheck_proxy(pool.current, proxy_pool.robots_url(url),
+                                          timeout=min(getattr(args, "timeout", 30), 30))
+            except proxy_pool.ProxyPrecheckError as exc:
+                print(proxy_pool.precheck_message(exc, "HOMEDEPOT_PROXY",
+                                                  "homedepot.com"), file=sys.stderr)
+                facts["transport_error"] = "proxy pre-check: %s" % exc
+                output_writer.write_failed_attempt(
+                    args.out, stop_reason=proxy_pool.PROXY_PRECHECK_STOP_REASON,
+                    mode=args.mode, start_url=url,
+                    pages_requested=args.pages,
+                    transport_error=facts["transport_error"], extra=facts)
+                return output_writer.EXIT_REMOTE_API_ERROR
+
     try:
         driver.start()
     except Exception as exc:  # noqa: BLE001
@@ -411,6 +432,7 @@ def run(args, driver) -> int:
               file=sys.stderr)
         facts["transport_error"] = "start: %s" % mask_text(str(exc))[:300]
         return _finish(args, rows, facts, "transport_failed")
+    facts["media_blocked"] = bool(getattr(driver, "media_blocked", False))
 
     stop_reason: Optional[str] = None
     try:
@@ -630,6 +652,12 @@ def build_parser(description: str):
     p.add_argument("--proxy-rotate", choices=proxy_pool.ROTATE_MODES,
                    default="per-run")
     p.add_argument("--proxy-shuffle", action="store_true")
+    p.add_argument("--load-media", action="store_true",
+                   help="Load images, video and web fonts. By default they are "
+                        "aborted while a local browser goes through --proxy / "
+                        "--proxy-file (no parser reads them, and the proxy bills "
+                        "per byte); never blocked with --cdp-endpoint or no proxy.")
+    p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--twocaptcha-key", default=None,
                    help="Prefer TWOCAPTCHA_KEY in .env — `ps` reads argv.")
     p.add_argument("--captcha-api", choices=["v2", "v1"], default="v2")

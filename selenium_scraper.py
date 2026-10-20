@@ -42,6 +42,7 @@ class SeleniumDriver:
     def __init__(self, args):
         self.args = args
         self._driver = None
+        self.media_blocked = False
 
     def start(self):
         if self.args.cdp_endpoint:
@@ -75,6 +76,11 @@ class SeleniumDriver:
             options.add_argument("--proxy-server=%s" % bare)
         self._driver = webdriver.Chrome(options=options)
         self._driver.set_page_load_timeout(self.args.timeout)
+        if proxy_pool.should_block_media(self.args, proxy_in_use=bool(pool)):
+            # By URL pattern (Selenium has no request events): an image
+            # served without a file extension still loads.
+            proxy_pool.selenium_block_media(self._driver)
+            self.media_blocked = True
 
     def navigate(self, url):
         self._driver.get(url)

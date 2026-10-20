@@ -12,7 +12,34 @@ violation.
 
 ## [Unreleased]
 
+> **Behaviour changes.**
+> - The browser engines (`playwright_scraper.py`, `puppeteer_scraper.py`,
+>   `selenium_scraper.py`) send ONE `HEAD` for
+>   `https://www.homedepot.com/robots.txt` through `--proxy` /
+>   `--proxy-file` before starting a local browser. A gateway `407` or `402`
+>   now ends the run there with exit 5 and `stop_reason: proxy_auth_failed`
+>   in `<out>.latest_attempt.meta.json`, instead of starting a browser on a
+>   refused proxy. Nothing is pre-checked with `--cdp-endpoint` or no proxy.
+> - Behind a local proxy, those engines now abort images, video/audio and
+>   web fonts. `--load-media` restores them. Nothing changes with
+>   `--cdp-endpoint` or with no proxy.
+> - `catalog_walk.py` reported a proxy `407` as blocked (exit 3); it is now
+>   exit 5.
+
+### Added
+
+- `--load-media` on the browser engines; `transport_facts.media_blocked` in
+  the sidecars.
+
 ### Changed
+
+- A proxy `402` (traffic/balance exhausted) is handled like a `407` in
+  `http_scraper.py` and `catalog_walk.py`: exit 5, never retried or rotated.
+  With `--http-client requests` a gateway `407`/`402` used to be retried as a
+  transport error; it now stops on the first request too. On a refusal
+  before any row, `http_scraper.py` writes only
+  `<out>.latest_attempt.meta.json` (`status: failed`,
+  `stop_reason: proxy_auth_failed`), even with `--allow-empty`.
 
 - CI only: the canary bills a paid route (`HOMEDEPOT_PROXY` or
   `HOMEDEPOT_CDP_ENDPOINT`), so it now runs weekly (Mondays 06:17 UTC) instead of

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -158,13 +159,16 @@ class CurlSession:
             message = _mask_text(completed.stderr.strip()[:300])
             # curl 56 with a 407, or an explicit auth complaint, is the PROXY
             # refusing us — not the site. See ProxyAuthError.
-            if completed.returncode in (56, 7) and "407" in message:
-                raise ProxyAuthError(message)
+            if completed.returncode in (56, 7):
+                for code in proxy_pool.PROXY_PRECHECK_STATUSES:
+                    if re.search(r"\b%d\b" % code, message):
+                        raise ProxyAuthError(status=code)
             raise CurlError("curl exited %d: %s"
                             % (completed.returncode, message))
         body, _, trailer = completed.stdout.rpartition("\n")
-        if trailer.strip().startswith("407"):
-            raise ProxyAuthError("the proxy refused the credential (HTTP 407)")
+        head = trailer.strip()[:3]
+        if head == "407" or (head == "402" and self.proxy):
+            raise ProxyAuthError(status=int(head))
         parts = trailer.split(" ", 1)
         try:
             status = int(parts[0])
@@ -191,8 +195,15 @@ class ProxyAuthError(CurlError):
 
     Rotating an exit cannot help either: every exit on a dead credential
     fails the same way, so a run that retried would burn its whole budget
-    discovering that. It is raised rather than retried.
+    discovering that. It is raised rather than retried. A 402 (traffic/balance
+    exhausted) is the same kind of failure and is raised as this class too,
+    with `.status` 402.
     """
+
+    def __init__(self, message: str = "", status: int = 407):
+        self.status = status if status in proxy_pool.PROXY_PRECHECK_STATUSES else 407
+        super().__init__(message or "HTTP %d: %s" % (
+            self.status, proxy_pool.PROXY_PRECHECK_STATUSES[self.status]))
 
 
 class _CurlResponse:
@@ -307,6 +318,13 @@ def fetch(session, url: str, timeout: int, *, retries: int = 2,
             # fails identically.
             raise
         except Exception as exc:  # requests and curl both raise a wide family
+            # `requests` reports the gateway's answer to CONNECT as
+            # "Tunnel connection failed: 407 ..." inside a ProxyError: the
+            # same refusal curl reports as ProxyAuthError, so the same exit.
+            if requests is not None and isinstance(exc, requests.exceptions.ProxyError):
+                match = proxy_pool._STATUS_IN_ERROR_RE.search(str(exc))
+                if match:
+                    raise ProxyAuthError(status=int(match.group(1))) from None
             # `proxy_pool.mask()` is for a URL, not for free text: handed an
             # exception message it returns "?://?" and destroys it.
             masked = _mask_text(str(exc))
@@ -416,8 +434,8 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
                          retries=args.retries, retry_delay=args.retry_delay,
                          log=log, rotate=rotate)
         except ProxyAuthError as exc:
-            print(PROXY_AUTH_MESSAGE % exc, file=sys.stderr)
-            facts["transport_error"] = "proxy refused the credential"
+            print(proxy_message(exc), file=sys.stderr)
+            facts["transport_error"] = "proxy: %s" % exc
             facts["failed_pages"].append(page)
             facts["stop_reason"] = "proxy_auth_failed"
             return None
@@ -658,14 +676,13 @@ def _stop_reason(args, facts: Dict[str, Any]) -> str:
     return "no_new_products"
 
 
-PROXY_AUTH_MESSAGE = (
-    "[!] the proxy refused the credential: %s\n"
-    "    This is NOT the site blocking the scraper — homedepot.com was never "
-    "reached.\n"
-    "    Check HOMEDEPOT_PROXY in .env; a rotated or expired credential fails "
-    "exactly like this,\n"
-    "    and every exit on it fails the same way, so retrying or rotating "
-    "will not help.")
+def proxy_message(exc: "ProxyAuthError") -> str:
+    """The one wording for a gateway 407/402, shared with the browser engines."""
+    return proxy_pool.precheck_message(
+        proxy_pool.ProxyPrecheckError(exc.status), "HOMEDEPOT_PROXY",
+        "homedepot.com", browser=False) + (
+        "\n    This is NOT the site blocking the scraper. Every exit on that "
+        "credential fails the same way, so retrying or rotating will not help.")
 
 
 def main(argv=None) -> int:
@@ -673,7 +690,11 @@ def main(argv=None) -> int:
     try:
         rows, facts = scrape(args)
     except ProxyAuthError as exc:
-        print(PROXY_AUTH_MESSAGE % exc, file=sys.stderr)
+        print(proxy_message(exc), file=sys.stderr)
+        output_writer.write_failed_attempt(
+            args.out, stop_reason=proxy_pool.PROXY_PRECHECK_STOP_REASON,
+            mode=args.mode, start_url=args.url, pages_requested=args.pages,
+            transport_error="proxy: %s" % exc)
         return output_writer.EXIT_REMOTE_API_ERROR
     except SystemExit:
         raise
@@ -682,6 +703,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
     stop_reason = _stop_reason(args, facts)
+    if not rows and stop_reason == proxy_pool.PROXY_PRECHECK_STOP_REASON:
+        # The gateway refused before anything was fetched: there is no
+        # answer, so nothing replaces the data, even with --allow-empty.
+        output_writer.write_failed_attempt(
+            args.out, stop_reason=stop_reason, mode=args.mode,
+            start_url=facts.get("start_url"), pages_requested=args.pages,
+            transport_error=facts.get("transport_error") or "proxy", extra=facts)
+        return output_writer.EXIT_REMOTE_API_ERROR
     return finish_run(
         rows, args.out, args.format, args.allow_empty,
         blocked=facts["blocked"],
