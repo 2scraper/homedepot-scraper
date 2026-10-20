@@ -83,9 +83,12 @@ asked for.
 
 ---
 
-## Exit 5, and the run says the proxy refused the credential
+## Exit 5, and the run says the proxy pre-check failed or the proxy refused the credential
 
-An HTTP 407 on the CONNECT tunnel. **homedepot.com was never reached**, so this
+An HTTP 407 (credential refused, or traffic balance exhausted) or 402
+(traffic/balance exhausted) from the proxy gateway. The browser engines find
+out with one `HEAD` for `robots.txt` before starting a browser; the HTTP
+engine on its first request. **homedepot.com was never reached**, so this
 is not the site blocking you and no amount of new exits, longer backoff or
 switching to a browser will help. Every exit on a dead credential fails
 identically, which is why this is neither retried nor rotated.

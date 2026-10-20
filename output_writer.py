@@ -344,6 +344,29 @@ def write_attempt_meta(out_prefix: str, meta: dict) -> str:
     return write_run_meta(out_prefix, meta, suffix=ATTEMPT_META_SUFFIX)
 
 
+def write_failed_attempt(out_prefix: str, *, stop_reason: str, mode: str,
+                         start_url: Optional[str], pages_requested: int,
+                         transport_error: str,
+                         extra: Optional[dict] = None) -> str:
+    """Record a run that ended before `finish_run` could, e.g. because the
+    proxy gateway refused the pre-check. Only the attempt sidecar is written:
+    `.meta.json` and the data beside it stay as they were, whatever
+    `--allow-empty` says — nothing was fetched, so there is no answer to
+    write, empty or otherwise.
+    """
+    import uuid
+    meta = run_meta(status="failed", stop_reason=stop_reason,
+                    pages_requested=pages_requested, pages_completed=0,
+                    start_url=start_url or "", final_url=start_url or "",
+                    products=0, mode=mode)
+    meta.update(run_id=uuid.uuid4().hex[:12], blocked=False,
+                csv_cells_escaped=None, transport_error=transport_error,
+                data_updated=False)
+    if extra:
+        meta["transport_facts"] = extra
+    return write_attempt_meta(out_prefix, meta)
+
+
 def schema_version() -> str:
     """A short fingerprint of the row schema, so a diff can refuse to compare
     a run written before a column changed with one written after."""

@@ -2105,6 +2105,304 @@ def test_no_other_sites_vocabulary_in_any_shipped_file():
     eq("no tracked file carries another site's vocabulary", found, [])
 
 
+# ---------------------------------------------------------------------------
+# Traffic savers: the proxy pre-check and media blocking
+# ---------------------------------------------------------------------------
+
+def _status_proxy(status):
+    """A local stand-in for a proxy gateway that answers every request,
+    CONNECT included, with `status`. Returns (server, port, hits)."""
+    import http.server
+    import socketserver
+    import threading
+    hits = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _answer(self):
+            hits.append((self.command, self.path))
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Proxy-Authenticate", 'Basic realm="stub"')
+            self.end_headers()
+        do_CONNECT = do_GET = do_HEAD = _answer
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], hits
+
+
+class _CountingDriver(_PageDriver):
+    def __init__(self, pages):
+        super().__init__(pages)
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+
+
+def test_proxy_precheck_stops_before_the_browser():
+    import browser_bridge
+    import output_writer as W
+    import proxy_pool
+    for status, words in ((407, "refused the credential"), (402, "balance exhausted")):
+        server, port, hits = _status_proxy(status)
+        try:
+            tmp = tempfile.mkdtemp()
+            driver = _CountingDriver([fixture("listing_mitersaws.html")])
+            proxy = "http://user:S3cretPw@127.0.0.1:%d" % port
+            args = _BridgeArgs(os.path.join(tmp, "run"), proxy=proxy,
+                               cdp_endpoint=None, allow_empty=True, timeout=5)
+            rc, text = _quiet(browser_bridge.run, args, driver)
+        finally:
+            server.shutdown()
+            server.server_close()
+        eq("pre-check: a proxy %d exits 5" % status, rc, 5)
+        eq("pre-check: ...before the browser is started (%d)" % status, driver.started, 0)
+        eq("pre-check: ...after ONE request, for robots.txt (%d)" % status,
+           hits, [("CONNECT", "www.homedepot.com:443")])
+        check("pre-check: ...says why (%d)" % status,
+              words in text and "HOMEDEPOT_PROXY" in text, text[-300:])
+        check("pre-check: ...and never prints the credential (%d)" % status,
+              "S3cretPw" not in text)
+        meta_path = os.path.join(tmp, "run" + W.ATTEMPT_META_SUFFIX)
+        meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+        eq("pre-check: ...attempt sidecar failed/proxy_auth_failed (%d)" % status,
+           (meta.get("status"), meta.get("stop_reason"), meta.get("data_updated")),
+           ("failed", "proxy_auth_failed", False))
+        check("pre-check: ...and the sidecar never holds the credential (%d)" % status,
+              "S3cretPw" not in json.dumps(meta))
+        eq("pre-check: ...no data or dataset sidecar, even with --allow-empty (%d)" % status,
+           sorted(os.listdir(tmp)), ["run" + W.ATTEMPT_META_SUFFIX])
+    # Not a gateway verdict: a site 403 through the tunnel, or an unreachable
+    # proxy, keeps the run going exactly as before.
+    server, port, hits = _status_proxy(403)
+    try:
+        got = proxy_pool.precheck_proxy("http://u:p@127.0.0.1:%d" % port,
+                                        "https://www.homedepot.com/robots.txt", 5)
+    finally:
+        server.shutdown()
+        server.server_close()
+    eq("pre-check: a 403 is not a proxy failure", got, None)
+    eq("pre-check: an unreachable proxy is not a proxy failure (transport keeps its path)",
+       proxy_pool.precheck_proxy("http://u:p@127.0.0.1:1", "https://x.invalid/robots.txt", 3), None)
+    eq("pre-check: no proxy, no request",
+       proxy_pool.precheck_proxy(None, "https://x/robots.txt"), None)
+    eq("pre-check: robots.txt of the start URL",
+       proxy_pool.robots_url(LISTING_URL + "?Nao=24"), "https://www.homedepot.com/robots.txt")
+    # A 403 pre-check continues into the browser.
+    server, port, hits = _status_proxy(403)
+    try:
+        driver = _CountingDriver([fixture("listing_mitersaws.html")])
+        rc, _ = _quiet(browser_bridge.run, _BridgeArgs(
+            os.path.join(tempfile.mkdtemp(), "r"), pages=1, cdp_endpoint=None,
+            proxy="http://u:p@127.0.0.1:%d" % port, timeout=5), driver)
+    finally:
+        server.shutdown()
+        server.server_close()
+    eq("pre-check: after a 403 the browser still starts", driver.started, 1)
+    eq("pre-check: ...and the run is the run it was", rc, 0)
+    from unittest import mock
+    driver = _CountingDriver([fixture("listing_mitersaws.html")])
+    with mock.patch.object(proxy_pool, "precheck_proxy",
+                           side_effect=AssertionError("pre-check over CDP")):
+        rc, _ = _quiet(browser_bridge.run, _BridgeArgs(
+            os.path.join(tempfile.mkdtemp(), "c"), pages=1,
+            cdp_endpoint="ws://127.0.0.1:1", proxy=None), driver)
+    eq("pre-check: never run over CDP (the remote browser brings its own exit)", rc, 0)
+    driver = _CountingDriver([fixture("listing_mitersaws.html")])
+    with mock.patch.object(proxy_pool, "precheck_proxy",
+                           side_effect=AssertionError("pre-check with no proxy")):
+        rc, _ = _quiet(browser_bridge.run, _BridgeArgs(
+            os.path.join(tempfile.mkdtemp(), "n"), pages=1,
+            cdp_endpoint=None, proxy=None), driver)
+    eq("pre-check: never run with no proxy", rc, 0)
+
+
+def test_http_paths_treat_a_402_like_a_407():
+    import http_scraper
+    import output_writer as W
+    from unittest import mock
+
+    class Curl402:
+        returncode = 56
+        stdout = ""
+        stderr = "curl: (56) CONNECT tunnel failed, response 402"
+    with mock.patch.object(http_scraper.subprocess, "run", lambda *a, **k: Curl402()):
+        try:
+            http_scraper.CurlSession(PLACEHOLDER_PROXY).get(LISTING_URL, timeout=5)
+            status = None
+        except http_scraper.ProxyAuthError as exc:
+            status = exc.status
+    eq("curl: a CONNECT 402 raises ProxyAuthError(402)", status, 402)
+    # requests: the gateway's CONNECT answer arrives inside a ProxyError.
+    if http_scraper.requests is not None:
+        for code in (407, 402):
+            server, port, hits = _status_proxy(code)
+            try:
+                session = http_scraper.build_session(
+                    "http://u:S3cretPw@127.0.0.1:%d" % port, "requests")
+                try:
+                    http_scraper.fetch(session, LISTING_URL, 5, retries=3, retry_delay=0)
+                    got = None
+                except http_scraper.ProxyAuthError as exc:
+                    got = exc.status
+            finally:
+                server.shutdown()
+                server.server_close()
+            eq("requests: a CONNECT %d raises ProxyAuthError, not retried" % code,
+               (got, len(hits)), (code, 1))
+    for code, words in ((407, "refused the credential"), (402, "balance exhausted")):
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(http_scraper, "scrape",
+                               side_effect=http_scraper.ProxyAuthError(status=code)):
+            rc, text = _quiet(http_scraper.main, ["--url", LISTING_URL, "--out",
+                                                  os.path.join(tmp, "r"), "--allow-empty"])
+        eq("http_scraper: a proxy %d exits 5" % code, rc, 5)
+        check("http_scraper: ...names HOMEDEPOT_PROXY and says why (%d)" % code,
+              words in text and "HOMEDEPOT_PROXY" in text, text[-300:])
+        eq("http_scraper: ...only the attempt sidecar is written (%d)" % code,
+           sorted(os.listdir(tmp)), ["r" + W.ATTEMPT_META_SUFFIX])
+    # The first request's refusal, end to end through curl and the stub.
+    if http_scraper.CURL_AVAILABLE:
+        server, port, hits = _status_proxy(402)
+        tmp = tempfile.mkdtemp()
+        try:
+            rc, text = _quiet(http_scraper.main, [
+                "--url", LISTING_URL, "--out", os.path.join(tmp, "r"),
+                "--proxy", "http://u:S3cretPw@127.0.0.1:%d" % port,
+                "--http-client", "curl", "--timeout", "5", "--allow-empty"])
+        finally:
+            server.shutdown()
+            server.server_close()
+        meta_path = os.path.join(tmp, "r" + W.ATTEMPT_META_SUFFIX)
+        meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+        eq("http_scraper via curl: a gateway 402 exits 5 after one request",
+           (rc, len(hits)), (5, 1))
+        eq("http_scraper via curl: ...failed/proxy_auth_failed, no data even with --allow-empty",
+           (meta.get("status"), meta.get("stop_reason"), sorted(os.listdir(tmp))),
+           ("failed", "proxy_auth_failed", ["r" + W.ATTEMPT_META_SUFFIX]))
+        check("http_scraper via curl: ...without printing the credential",
+              "S3cretPw" not in text and "S3cretPw" not in json.dumps(meta))
+    import catalog_walk
+    server, port, _ = _status_proxy(407)
+    try:
+        rc, text = _quiet(catalog_walk.main, [
+            "categories", "--timeout", "5",
+            "--proxy", "http://u:S3cretPw@127.0.0.1:%d" % port])
+    finally:
+        server.shutdown()
+        server.server_close()
+    eq("catalog_walk: a proxy 407 exits 5, not 3", rc, 5)
+    check("catalog_walk: ...without printing the credential",
+          "S3cretPw" not in text and "refused the credential" in text, text[-300:])
+
+
+def test_media_blocking_policy():
+    import proxy_pool
+    ns = argparse.Namespace
+    eq("media: blocked behind a local proxy",
+       proxy_pool.should_block_media(ns(load_media=False), proxy_in_use=True), True)
+    eq("media: --load-media keeps it",
+       proxy_pool.should_block_media(ns(load_media=True), proxy_in_use=True), False)
+    eq("media: no proxy, nothing metered, nothing blocked",
+       proxy_pool.should_block_media(ns(load_media=False), proxy_in_use=False), False)
+    eq("media: never over CDP",
+       proxy_pool.should_block_media(ns(load_media=False), proxy_in_use=True, over_cdp=True), False)
+    eq("media: the hidden test switch forces it without a proxy",
+       proxy_pool.should_block_media(ns(load_media=False, force_block_media=True),
+                                     proxy_in_use=False), True)
+
+    class Route:
+        def __init__(self, kind):
+            self.request = ns(resource_type=kind)
+            self.done = None
+
+        def abort(self, reason=None):
+            self.done = ("abort", reason)
+
+        def continue_(self):
+            self.done = ("continue",)
+    for kind, want in (("image", "abort"), ("media", "abort"), ("font", "abort"),
+                       ("document", "continue"), ("script", "continue"),
+                       ("xhr", "continue"), ("fetch", "continue"),
+                       ("stylesheet", "continue")):
+        route = Route(kind)
+        proxy_pool.playwright_media_route(route)
+        eq("media: playwright %s -> %s" % (kind, want), route.done[0], want)
+
+    class Sel:
+        def __init__(self):
+            self.sent = []
+
+        def execute_cdp_cmd(self, cmd, params):
+            self.sent.append((cmd, params))
+    sel = Sel()
+    proxy_pool.selenium_block_media(sel)
+    blocked = dict(sel.sent).get("Network.setBlockedURLs", {}).get("urls", [])
+    check("media: selenium blocks images, video and fonts by URL",
+          all(p in blocked for p in ("*.jpg", "*.webp?*", "*.mp4", "*.woff2")) and
+          not any(p.startswith("*.js") or p.startswith("*.css") for p in blocked), blocked)
+
+    import asyncio
+
+    class Client:
+        def __init__(self):
+            self.sent, self.handlers = [], {}
+
+        def on(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send(self, cmd, params=None):
+            self.sent.append((cmd, params))
+
+    client = Client()
+
+    async def create():
+        return client
+    page = ns(target=ns(createCDPSession=create))
+    loop = asyncio.new_event_loop()
+    try:
+        async def drive():
+            await proxy_pool.pyppeteer_block_media(page)
+            client.handlers["Fetch.requestPaused"]({"requestId": "r1", "resourceType": "Image"})
+            await asyncio.sleep(0)
+        loop.run_until_complete(drive())
+    finally:
+        loop.close()
+    patterns = dict(client.sent)["Fetch.enable"]["patterns"]
+    eq("media: pyppeteer pauses only images, media and fonts",
+       sorted(p["resourceType"] for p in patterns), ["Font", "Image", "Media"])
+    eq("media: ...and fails what it paused",
+       client.sent[-1], ("Fetch.failRequest", {"requestId": "r1", "errorReason": "BlockedByClient"}))
+    # Every local-browser engine must consult the policy. A source check,
+    # because the suite runs without a browser binary.
+    for module, call in (("playwright_scraper", "playwright_media_route"),
+                         ("selenium_scraper", "selenium_block_media"),
+                         ("puppeteer_scraper", "pyppeteer_block_media")):
+        source = open(os.path.join(HERE, module + ".py"), encoding="utf-8").read()
+        check("media: %s applies the policy" % module,
+              "should_block_media(" in source and call in source)
+    import browser_bridge
+    parser = browser_bridge.build_parser("t")
+    eq("media: --load-media is off by default",
+       parser.parse_args(["--url", LISTING_URL]).load_media, False)
+    text = parser.format_help()
+    check("media: --load-media is documented in --help, the test switch is not",
+          "--load-media" in text and "--force-block-media" not in text)
+    # The sidecar records whether the browser blocked anything.
+    driver = _CountingDriver([fixture("listing_mitersaws.html")])
+    driver.media_blocked = True
+    tmp = tempfile.mkdtemp()
+    _quiet(browser_bridge.run, _BridgeArgs(os.path.join(tmp, "m"), pages=1), driver)
+    meta = json.load(open(os.path.join(tmp, "m.meta.json")))
+    eq("media: the sidecar records transport_facts.media_blocked",
+       meta.get("transport_facts", {}).get("media_blocked"), True)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

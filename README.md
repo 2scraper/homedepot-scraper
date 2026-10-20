@@ -351,6 +351,43 @@ profile_locked` plainly, **but that call itself takes the lock**, so use it as
 a one-off diagnostic and never as a pre-flight. If a profile is stuck, stop
 touching it and wait.
 
+### Two traffic savers behind a proxy
+
+* **Proxy pre-check.** Before a browser engine (`playwright_scraper.py`,
+  `puppeteer_scraper.py`, `selenium_scraper.py`) starts a local browser
+  behind `--proxy` / `--proxy-file`, it sends ONE `HEAD` for
+  `https://www.homedepot.com/robots.txt` through that proxy. A gateway `407`
+  (the credential was refused, or the traffic balance is exhausted) or `402`
+  (traffic/balance exhausted) ends the run there: exit `5`, a message naming
+  `HOMEDEPOT_PROXY` (never its value), and `<out>.latest_attempt.meta.json`
+  with `status: failed` and `stop_reason: proxy_auth_failed`. The data and
+  `<out>.meta.json` are left as they were, even with `--allow-empty`. It is
+  neither retried nor rotated: every exit on a refused credential or an
+  exhausted balance answers the same way. Any other answer (a `200`, the
+  site's own `403`) or a transport error is not a verdict on the proxy, and
+  the run goes on as before. `http_scraper.py` and `catalog_walk.py` need no
+  extra request: their first request already stops the run the same way on a
+  `407` or `402`, through curl or `requests`. Nothing is pre-checked with
+  `--cdp-endpoint` or with no proxy.
+* **Media blocking.** While a LOCAL browser goes through `--proxy` /
+  `--proxy-file`, images, video/audio and web fonts are aborted: no parser
+  here reads them (image URLs come from the page's own data, and the page
+  classifier reads asset hostnames from the markup, which is unchanged), and a
+  residential proxy bills per byte. Playwright and pyppeteer abort them by
+  resource type; Selenium blocks them by file extension
+  (`Network.setBlockedURLs`), so an image served without one still loads
+  there. Playwright turns its HTTP cache off while a route is installed, so
+  scripts are fetched again on every page of a multi-page browser run.
+  Nothing is blocked with `--cdp-endpoint` or with no proxy, and
+  `--load-media` keeps everything. The sidecars record
+  `transport_facts.media_blocked`.
+* **Measured 2026-10-20**, with no proxy, one miter-saw listing page through
+  Playwright with and without the blocking forced on: both runs got Akamai's
+  `403` (339 bytes) from this datacentre address, so a live comparison of the
+  rows was not possible. Against a local test page, every engine fetched the
+  page and its script and none of its images, video or font with blocking on,
+  and all of them without it.
+
 ---
 
 ## Exit codes
@@ -368,8 +405,9 @@ touching it and wait.
 **`3` and `5` mean different things and the difference matters.** `5` covers a
 navigation timeout, a dropped connection or CDP socket, an empty document from
 a navigation that never completed, a `profile_locked` profile, a proxy
-credential that no longer authenticates (HTTP 407 on the CONNECT tunnel —
-homedepot.com is never reached at all), a failed Scraper API call, and a page
+credential that no longer authenticates or a proxy whose traffic balance is
+exhausted (HTTP 407 or 402 from the gateway — homedepot.com is never reached
+at all; `stop_reason: proxy_auth_failed`), a failed Scraper API call, and a page
 that lists products but parsed to none (a parser failure, not an empty
 category). Reporting any of those as `3` sends you to the anti-bot problem
 when the answer is somewhere else entirely. If one of them happens AFTER some

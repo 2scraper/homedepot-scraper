@@ -35,6 +35,7 @@ class PuppeteerDriver:
         self._loop = None
         self._browser = None
         self._page = None
+        self.media_blocked = False
 
     def _run(self, coro):
         return self._loop.run_until_complete(coro)
@@ -65,6 +66,9 @@ class PuppeteerDriver:
             if credentials:
                 # Through the driver's own field, never on the command line.
                 self._run(self._page.authenticate(credentials))
+            if proxy_pool.should_block_media(self.args, proxy_in_use=bool(pool)):
+                self._run(proxy_pool.pyppeteer_block_media(self._page))
+                self.media_blocked = True
         if self._page is None:
             self._page = self._run(self._browser.newPage())
 
