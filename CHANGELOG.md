@@ -25,11 +25,30 @@ violation.
 >   `--cdp-endpoint` or with no proxy.
 > - `catalog_walk.py` reported a proxy `407` as blocked (exit 3); it is now
 >   exit 5.
+> - Every transport now stops once about 10 MB have gone through a local
+>   proxy (`--proxy-budget-mb`, `0` = unlimited): the rows read so far are
+>   kept and the run exits 6 (5 with none), `stop_reason:
+>   proxy_budget_exceeded`. `catalog_walk.py` exits 6 with the targets found
+>   so far, 5 with none. Nothing is limited over `--cdp-endpoint` or with no
+>   proxy.
 
 ### Added
 
 - `--load-media` on the browser engines; `transport_facts.media_blocked` in
   the sidecars.
+- Proxy traffic meter (`proxy_meter.py`) on every transport, active only
+  behind a local proxy: curl's own size counters, `requests` request/response
+  sizes, Playwright `request.sizes()`, and CDP
+  `Network.loadingFinished.encodedDataLength` plus request sizes for pyppeteer
+  and Selenium. An estimate of the tunnelled payload (TLS/`CONNECT` overhead
+  not included). Both sidecars record `proxy_bytes`, `proxy_budget_bytes` and
+  `proxy_budget_exceeded`; a proxied run ends with one `Proxy traffic: X.X MB
+  of Y MB budget` line. New flag `--proxy-budget-mb` (default 10) on every
+  CLI.
+- CI only: the canary passes `--proxy-budget-mb 10`, writes `**live**: proxy
+  traffic X.X MB of 10 MB` to the job summary and fails with
+  `::error::stopped: proxy budget 10 MB exceeded` when the run hit it. The
+  engine jobs run the meter against a stub proxy in a real browser.
 
 ### Changed
 

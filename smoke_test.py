@@ -1166,7 +1166,7 @@ def test_curl_session_keeps_the_proxy_off_argv():
 
     class FakeCompleted:
         returncode = 0
-        stdout = "<html></html>\n200 https://www.homedepot.com/b/A-B/N-1"
+        stdout = "<html></html>\n200 120 0 300 13 https://www.homedepot.com/b/A-B/N-1"
         stderr = ""
 
     def fake_run(command, **kwargs):
@@ -1340,7 +1340,7 @@ def test_unresolved_names():
     import builtins
     modules = ["product_parser", "output_writer", "page_flow", "http_scraper",
                "browser_bridge", "catalog_walk", "env_config", "proxy_pool",
-               "diff_runs"]
+               "proxy_meter", "diff_runs"]
     def bind_args(node, bound):
         a = getattr(node, "args", None)
         if a is None:
@@ -2401,6 +2401,438 @@ def test_media_blocking_policy():
     meta = json.load(open(os.path.join(tmp, "m.meta.json")))
     eq("media: the sidecar records transport_facts.media_blocked",
        meta.get("transport_facts", {}).get("media_blocked"), True)
+
+
+# ---------------------------------------------------------------------------
+# Proxy traffic meter and --proxy-budget-mb (proxy_meter.py; its byte counts
+# against a stub proxy in real browsers are in tests/test_proxy_meter.py)
+# ---------------------------------------------------------------------------
+
+def _sidecars(prefix):
+    import output_writer as W
+    out = []
+    for suffix in (".meta.json", W.ATTEMPT_META_SUFFIX):
+        path = prefix + suffix
+        out.append(json.load(open(path)) if os.path.exists(path) else None)
+    return out
+
+
+def test_proxy_budget_http_scraper():
+    import http_scraper
+    import output_writer as W
+    import proxy_meter
+    listing = fixture("listing_mitersaws.html")
+    blocked = fixture("blocked_access_denied.html")
+    original = http_scraper.build_session
+
+    def run(responses, argv, cost):
+        class Session:
+            calls = 0
+
+            def get(self, url, **kwargs):
+                Session.calls += 1
+                proxy_meter.current().add(cost)
+                return responses(url)
+        http_scraper.build_session = lambda *a, **k: Session()
+        tmp = tempfile.mkdtemp()
+        try:
+            rc, text = _quiet(http_scraper.main, [
+                "--url", LISTING_URL, "--pages", "3", "--retries", "1", "--retry-delay", "0",
+                "--delay", "0", "--format", "json", "--out", os.path.join(tmp, "o"), *argv])
+        finally:
+            http_scraper.build_session = original
+            proxy_meter.start(None, active=False)
+        return rc, Session.calls, text, tmp
+    proxied = ["--proxy", "http://127.0.0.1:9"]
+    # 6 MB a page against a 5 MB budget: page 1 spends it, page 2 is never asked.
+    rc, calls, text, tmp = run(lambda u: _Resp(200, listing), proxied + ["--proxy-budget-mb", "5"], 6_000_000)
+    meta, attempt = _sidecars(os.path.join(tmp, "o"))
+    eq("proxy budget (http): rows, then the budget -> exit 6", rc, W.EXIT_PARTIAL)
+    eq("proxy budget (http): ...and no second page is requested", calls, 1)
+    eq("proxy budget (http): ...stop_reason and the three sidecar keys",
+       (meta["stop_reason"], meta["proxy_bytes"], meta["proxy_budget_bytes"], meta["proxy_budget_exceeded"]),
+       ("proxy_budget_exceeded", 6_000_000, 5_000_000, True))
+    eq("proxy budget (http): ...the attempt sidecar agrees",
+       (attempt["stop_reason"], attempt["proxy_budget_exceeded"]), ("proxy_budget_exceeded", True))
+    eq("proxy budget (http): ...one summary line", text.count("Proxy traffic: 6.0 MB of 5 MB budget"), 1)
+    # Spent on a refused page: no rows -> 5, never 3 or 4; the data is not replaced.
+    rc, calls, text, tmp = run(lambda u: _Resp(403, blocked), proxied + ["--proxy-budget-mb", "1"], 2_000_000)
+    meta, attempt = _sidecars(os.path.join(tmp, "o"))
+    eq("proxy budget (http): no rows -> exit 5", rc, W.EXIT_REMOTE_API_ERROR)
+    eq("proxy budget (http): ...no dataset sidecar, the attempt one says why",
+       (meta, attempt["stop_reason"], attempt["proxy_bytes"], attempt["data_updated"]),
+       (None, "proxy_budget_exceeded", 2_000_000, False))
+    # The retry loop stops too: a challenge that would be retried is not asked again.
+    challenge = fixture("challenge_akamai.html")
+    rc, calls, text, tmp = run(lambda u: _Resp(200, challenge), proxied + ["--proxy-budget-mb", "1"], 2_000_000)
+    eq("proxy budget (http): no retry after the budget is spent", (calls, rc), (1, W.EXIT_REMOTE_API_ERROR))
+    # No proxy: nothing metered, nothing stopped, no summary line.
+    rc, calls, text, tmp = run(lambda u: _Resp(200, listing), ["--proxy-budget-mb", "0.001"], 10 ** 9)
+    meta, attempt = _sidecars(os.path.join(tmp, "o"))
+    eq("proxy budget (http): no proxy -> proxy_bytes null, not exceeded",
+       (meta["proxy_bytes"], meta["proxy_budget_bytes"], meta["proxy_budget_exceeded"]), (None, None, False))
+    check("proxy budget (http): ...and no 'Proxy traffic' line", "Proxy traffic" not in text)
+    eq("proxy budget (http): ...the run is the run it was", meta["stop_reason"] != "proxy_budget_exceeded", True)
+    # 0 = unlimited.
+    rc, calls, text, tmp = run(lambda u: _Resp(200, listing), proxied + ["--proxy-budget-mb", "0"], 10 ** 9)
+    meta, _ = _sidecars(os.path.join(tmp, "o"))
+    eq("proxy budget (http): 0 is unlimited",
+       (meta["proxy_budget_exceeded"], meta["proxy_budget_bytes"], meta["proxy_bytes"] >= 10 ** 9), (False, None, True))
+
+
+def test_proxy_budget_http_each_loop():
+    """The page loop and the retry loop each stop on their own."""
+    import http_scraper
+    import proxy_meter
+    from unittest import mock
+    listing = fixture("listing_mitersaws.html")
+    asked = []
+
+    def fake_fetch(session, url, timeout, **k):
+        asked.append(url)
+        proxy_meter.current().add(6_000_000)
+        return http_scraper.FetchResult(url, status=200, html=listing)
+    try:
+        with mock.patch.object(http_scraper, "fetch", fake_fetch), \
+                mock.patch.object(http_scraper, "build_session", lambda *a, **k: object()):
+            _quiet(http_scraper.main, ["--url", LISTING_URL, "--pages", "3", "--delay", "0", "--format", "json",
+                                       "--out", os.path.join(tempfile.mkdtemp(), "o"),
+                                       "--proxy", "http://127.0.0.1:9", "--proxy-budget-mb", "5"])
+        eq("proxy budget (http page loop): no page after the one that spent it", len(asked), 1)
+
+        class Dying:
+            calls = 0
+
+            def get(self, url, **k):
+                Dying.calls += 1
+                proxy_meter.current().add(2_000_000)
+                raise ConnectionError("reset")
+        proxy_meter.start(1, active=True)
+        result = http_scraper.fetch(Dying(), LISTING_URL, 5, retries=3, retry_delay=0)
+        eq("proxy budget (http retry loop): no retry once the budget is spent", Dying.calls, 1)
+        check("proxy budget (http retry loop): ...the result is the failed attempt", result.error is not None)
+    finally:
+        proxy_meter.start(None, active=False)
+
+
+def test_proxy_meter_counts_curl_and_requests():
+    import http_scraper
+    import proxy_meter
+    from unittest import mock
+
+    class Completed:
+        returncode = 0
+        stdout = "<html></html>\n200 120 7 300 13 https://www.homedepot.com/b/A-B/N-1"
+        stderr = ""
+    try:
+        meter = proxy_meter.start(10, active=True)
+        with mock.patch.object(http_scraper.subprocess, "run", lambda *a, **k: Completed()):
+            response = http_scraper.CurlSession(PLACEHOLDER_PROXY).get(LISTING_URL, timeout=5)
+            eq("curl: the status and final URL still parse", (response.status_code, response.url),
+               (200, "https://www.homedepot.com/b/A-B/N-1"))
+            eq("curl: size_request + size_upload + size_header + size_download are counted", meter.bytes, 440)
+            http_scraper.CurlSession(None).get(LISTING_URL, timeout=5)
+            eq("curl: a session with no proxy adds nothing", meter.bytes, 440)
+    finally:
+        proxy_meter.start(None, active=False)
+    if http_scraper.requests is None:
+        SKIPS.append("requests meter (requests absent)")
+        return
+    sys.path.insert(0, os.path.join(HERE, "tests"))
+    from test_proxy_meter import PAGES, StubProxy
+    stub = StubProxy()
+    try:
+        meter = proxy_meter.start(0, active=True)
+        session = http_scraper.build_session(stub.url, "requests")
+        for path in PAGES:
+            session.get("http://meter.test" + path, timeout=10)
+        import time as _time
+        _time.sleep(0.2)
+        truth = stub.site_bytes()
+        check("requests: a proxied session counts what crossed the stub proxy (within 2%%: %d vs %d)"
+              % (meter.bytes, truth), truth > 100_000 and abs(meter.bytes - truth) / truth < 0.02)
+        if http_scraper.CURL_AVAILABLE:
+            meter = proxy_meter.start(0, active=True)
+            stub.per_path.clear()
+            curl = http_scraper.CurlSession(stub.url)
+            for path in PAGES:
+                curl.get("http://meter.test" + path, timeout=10)
+            _time.sleep(0.2)
+            truth = stub.site_bytes()
+            check("curl: a proxied session counts what crossed the stub proxy (within 5%%: %d vs %d)"
+                  % (meter.bytes, truth), truth > 100_000 and abs(meter.bytes - truth) / truth < 0.05)
+        before = meter.bytes
+        plain = http_scraper.build_session(None, "requests")
+        check("requests: a session with no proxy has no meter hook", not plain.hooks["response"])
+        eq("requests: ...and adds nothing", meter.bytes, before)
+    finally:
+        stub.close()
+        proxy_meter.start(None, active=False)
+
+
+def test_proxy_budget_browser_bridge():
+    import browser_bridge
+    import output_writer as W
+    import proxy_meter
+    import proxy_pool
+    from unittest import mock
+    listing = fixture("listing_mitersaws.html")
+    blocked = fixture("blocked_access_denied.html")
+
+    class Driver(_PageDriver):
+        cost = 0
+
+        def navigate(self, url):
+            proxy_meter.current().add(self.cost)
+            return super().navigate(url)
+
+    def run(pages, cost, **overrides):
+        driver = Driver(pages)
+        driver.cost = cost
+        tmp = tempfile.mkdtemp()
+        args = _BridgeArgs(os.path.join(tmp, "r"), **dict(dict(pages=3, cdp_endpoint=None, proxy="http://127.0.0.1:9",
+                                                               proxy_budget_mb=0.001), **overrides))
+        try:
+            with mock.patch.object(proxy_pool, "precheck_proxy", lambda *a, **k: None):
+                rc, text = _quiet(browser_bridge.run, args, driver)
+        finally:
+            proxy_meter.start(None, active=False)
+        return rc, driver, text, _sidecars(os.path.join(tmp, "r"))
+    # A different listing each page would continue; the budget stops it after page 1.
+    rc, driver, text, (meta, attempt) = run([listing, listing.replace("N-5yc1vZc2d7", "N-x")], 5000)
+    eq("proxy budget (browser): rows then the budget -> exit 6", rc, W.EXIT_PARTIAL)
+    eq("proxy budget (browser): ...no second page is opened", driver.visits, 1)
+    eq("proxy budget (browser): ...sidecar",
+       (meta["stop_reason"], meta["proxy_bytes"], meta["proxy_budget_bytes"], meta["proxy_budget_exceeded"]),
+       ("proxy_budget_exceeded", 5000, 1000, True))
+    check("proxy budget (browser): ...summary line", "Proxy traffic: 0.0 MB of 0.001 MB budget" in text, text[-300:])
+    rc, driver, text, (meta, attempt) = run([blocked], 5000)
+    eq("proxy budget (browser): a refused page after the budget is 5, not 3", rc, W.EXIT_REMOTE_API_ERROR)
+    eq("proxy budget (browser): ...attempt sidecar", (meta, attempt["stop_reason"], attempt["proxy_budget_exceeded"]),
+       (None, "proxy_budget_exceeded", True))
+    rc, driver, text, (meta, attempt) = run([listing], 10 ** 9, cdp_endpoint="ws://127.0.0.1:1", proxy=None)
+    eq("proxy budget (browser): over CDP nothing is metered",
+       (meta["proxy_bytes"], meta["proxy_budget_exceeded"], "Proxy traffic" in text), (None, False, False))
+    rc, driver, text, (meta, attempt) = run([listing], 10 ** 9, proxy=None)
+    eq("proxy budget (browser): no proxy, nothing metered", (meta["proxy_bytes"], rc != W.EXIT_PARTIAL or
+                                                            meta["stop_reason"] != "proxy_budget_exceeded"),
+       (None, True))
+
+
+def test_proxy_budget_finish_precedence():
+    """The budget stop is above blocked / failed pages: 6 with rows, 5 without."""
+    import output_writer as W
+    import proxy_meter
+    try:
+        for rows, blocked, reason, want in (([W.Product(sku="1")], True, "blocked", 6), ([], True, "blocked", 5),
+                                            ([W.Product(sku="1")], False, "completed", 6),
+                                            ([], False, "hub_not_a_listing", 5)):
+            proxy_meter.start(0.001, active=True)
+            proxy_meter.current().add(5000)
+            tmp = tempfile.mkdtemp()
+            rc, _ = _quiet(W.finish_run, rows, os.path.join(tmp, "o"), "json", False, blocked=blocked,
+                           stop_reason=reason, pages_requested=2, pages_completed=1, start_url="u", final_url="u")
+            _, attempt = _sidecars(os.path.join(tmp, "o"))
+            eq("proxy budget: finish_run over %s/%d rows -> %d" % (reason, len(rows), want),
+               (rc, attempt["stop_reason"], attempt["proxy_budget_exceeded"]), (want, "proxy_budget_exceeded", True))
+    finally:
+        proxy_meter.start(None, active=False)
+
+
+def test_proxy_budget_catalog_walk():
+    import catalog_walk
+    import http_scraper
+    import proxy_meter
+    from unittest import mock
+    index = "<sitemapindex><sitemap><loc>https://www.homedepot.com/sitemap/B/PLP_CORE_TAX-0.xml</loc></sitemap>" \
+            "<sitemap><loc>https://www.homedepot.com/sitemap/B/PLP_CORE_TAX-1.xml</loc></sitemap></sitemapindex>"
+    files = "<urlset><url><loc>%s</loc></url></urlset>" % LISTING_URL
+    asked = []
+
+    def fake_fetch(session, url, timeout, **k):
+        asked.append(url)
+        proxy_meter.current().add(3_000_000)
+        return http_scraper.FetchResult(url, status=200, html=index if url == catalog_walk.CATEGORY_INDEX else files)
+    try:
+        with mock.patch.object(http_scraper, "fetch", fake_fetch), \
+                mock.patch.object(http_scraper, "build_session", lambda *a, **k: object()):
+            rc, text = _quiet(catalog_walk.main, ["categories", "--proxy", "http://127.0.0.1:9",
+                                                  "--proxy-budget-mb", "5"])
+            eq("catalog_walk: the budget stops the walk with the targets found kept -> 6", rc, 6)
+            eq("catalog_walk: ...no sitemap file after it is spent", len(asked), 2)
+            check("catalog_walk: ...prints the summary line", "Proxy traffic: 6.0 MB of 5 MB budget" in text, text[-300:])
+            asked.clear()
+            rc, text = _quiet(catalog_walk.main, ["categories", "--proxy-budget-mb", "0.001"])
+            check("catalog_walk: no proxy, no budget", rc == 0 and len(asked) == 3 and "Proxy traffic" not in text,
+                  (rc, asked, text[-200:]))
+    finally:
+        proxy_meter.start(None, active=False)
+
+
+def test_proxy_budget_flag_everywhere():
+    import browser_bridge
+    import catalog_walk
+    import http_scraper
+    parsers = {
+        "browser engines": lambda argv: browser_bridge.build_parser("t").parse_args(["--url", LISTING_URL] + argv),
+        "http_scraper": lambda argv: http_scraper.parse_args(["--url", LISTING_URL] + argv),
+        "catalog_walk": None,
+    }
+    for name, parse in parsers.items():
+        if parse is None:
+            continue
+        eq("--proxy-budget-mb defaults to 10 (%s)" % name, parse([]).proxy_budget_mb, 10)
+        for bad in ("-1", "lots"):
+            try:
+                rc, text = _quiet(parse, ["--proxy-budget-mb", bad])
+            except SystemExit as exc:
+                rc = exc.code
+                text = ""
+            eq("--proxy-budget-mb %s is a usage error (%s)" % (bad, name), rc, 2)
+    check("browser engines document --proxy-budget-mb",
+          "--proxy-budget-mb" in browser_bridge.build_parser("t").format_help())
+    try:
+        rc, text = _quiet(catalog_walk.main, ["categories", "--proxy-budget-mb", "-1"])
+    except SystemExit as exc:
+        rc = exc.code
+    eq("catalog_walk: --proxy-budget-mb -1 is a usage error", rc, 2)
+    for name in ("browser_bridge", "http_scraper", "catalog_walk"):
+        source = open(os.path.join(HERE, name + ".py"), encoding="utf-8").read()
+        check("%s starts the run's meter" % name, "proxy_meter.start(" in source)
+
+
+def test_proxy_meter_wiring_per_engine():
+    """Each engine attaches the meter only to a LOCAL browser behind a proxy."""
+    import proxy_meter
+    from unittest import mock
+    try:
+        import playwright_scraper
+    except ImportError:
+        playwright_scraper = None
+        SKIPS.append("meter wiring (playwright absent)")
+    if playwright_scraper is not None:
+        class Ctx:
+            def __init__(self):
+                self.events, self.routes = [], []
+
+            def on(self, name, fn):
+                self.events.append(name)
+
+            def route(self, pattern, fn):
+                self.routes.append(fn)
+
+            def new_page(self):
+                return mock.MagicMock()
+
+        class PW:
+            def __init__(self):
+                self.ctx = Ctx()
+                self.chromium = self
+
+            def start(self):
+                return self
+
+            def launch(self, **kw):
+                return self
+
+            def new_context(self, **kw):
+                return self.ctx
+
+        for argv, want_events, want_routes in (([], True, 2), (["--proxy-budget-mb", "0"], True, 1),
+                                               (["--load-media"], True, 1), (None, False, 0)):
+            pw = PW()
+            import browser_bridge
+            args = browser_bridge.build_parser("t").parse_args(["--url", LISTING_URL] + (argv or []))
+            args.proxy = None if argv is None else "http://127.0.0.1:9"
+            args.proxy_file = None
+            proxy_meter.start(args.proxy_budget_mb, active=argv is not None)
+            with mock.patch.object(playwright_scraper, "sync_playwright", lambda: pw):
+                playwright_scraper.PlaywrightDriver(args).start()
+            eq("meter wiring (playwright %r): events, routes" % argv,
+               (sorted(set(pw.ctx.events)) == ["requestfailed", "requestfinished"], len(pw.ctx.routes)),
+               (want_events, want_routes))
+            if want_routes == 2:
+                check("meter wiring (playwright): the budget route is registered last (asked first)",
+                      pw.ctx.routes[-1] == proxy_meter.current().playwright_budget_route)
+    try:
+        import selenium_scraper
+    except ImportError:
+        selenium_scraper = None
+        SKIPS.append("meter wiring (selenium absent)")
+    if selenium_scraper is not None:
+        import browser_bridge
+        for proxied in (True, False):
+            class Driver:
+                def __init__(self, *a, options=None, **k):
+                    self.options = options
+
+                def set_page_load_timeout(self, t):
+                    pass
+
+                def execute_cdp_cmd(self, *a):
+                    pass
+
+                def get_log(self, kind):
+                    return []
+            args = browser_bridge.build_parser("t").parse_args(["--url", LISTING_URL])
+            args.proxy, args.proxy_file = ("http://127.0.0.1:9" if proxied else None), None
+            args.cdp_endpoint = None
+            proxy_meter.start(10, active=proxied)
+            with mock.patch.object(selenium_scraper.webdriver, "Chrome", Driver):
+                d = selenium_scraper.SeleniumDriver(args)
+                d.start()
+            caps = d._driver.options.to_capabilities().get("goog:loggingPrefs", {})
+            eq("meter wiring (selenium, proxy=%s): performance log + tee" % proxied,
+               (caps.get("performance") == "ALL", hasattr(d._driver, "_proxy_meter_poll")), (proxied, proxied))
+    for module in ("puppeteer_scraper",):
+        source = open(os.path.join(HERE, module + ".py"), encoding="utf-8").read()
+        check("meter wiring: %s attaches the CDP counter behind a local proxy only" % module,
+              "attach_pyppeteer(self._page)" in source and "if pool:" in source.split("attach_pyppeteer")[0][-200:])
+    proxy_meter.start(None, active=False)
+
+
+def test_canary_reports_proxy_traffic():
+    import subprocess
+    if not os.path.isdir(os.path.join(HERE, ".github")):
+        SKIPS.append("canary (no .github in this tree)")
+        return
+    text = open(os.path.join(HERE, ".github", "workflows", "canary.yml"), encoding="utf-8").read()
+    joined = text.replace("\\\n", " ")
+    runs = [line for line in joined.splitlines() if "_scraper.py" in line and "--out" in line]
+    check("canary: every run passes --proxy-budget-mb 10",
+          runs and all("--proxy-budget-mb 10" in line for line in runs), runs)
+    head, _, rest = text.partition("- name: Proxy traffic")
+    step = rest.split("- name:", 1)[0]
+    check("canary: a 'Proxy traffic' step follows the live run",
+          bool(rest) and "- name: Live run" in head and "if: always()" in step
+          and "python3 .github/proxy_traffic_summary.py canary live 10" in step, step)
+    script = os.path.join(HERE, ".github", "proxy_traffic_summary.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = os.path.join(tmp, "summary.md")
+        env = dict(os.environ, GITHUB_STEP_SUMMARY=summary)
+
+        def summarise(meta=None, attempt=None):
+            for suffix, data in ((".meta.json", meta), (".latest_attempt.meta.json", attempt)):
+                path = os.path.join(tmp, "canary" + suffix)
+                if os.path.exists(path):
+                    os.unlink(path)
+                if data is not None:
+                    open(path, "w").write(json.dumps(data))
+            proc = subprocess.run([sys.executable, script, "canary", "live", "10"], cwd=tmp, env=env,
+                                  capture_output=True, text=True, timeout=60)
+            last = open(summary).read().splitlines()[-1] if os.path.exists(summary) else ""
+            return proc, last
+        proc, last = summarise({"proxy_bytes": 4_321_000, "proxy_budget_exceeded": False, "finished_at": "2"},
+                               {"proxy_bytes": 4_321_000, "proxy_budget_exceeded": False, "finished_at": "2"})
+        eq("canary summary: the line", (proc.returncode, last), (0, "**live**: proxy traffic 4.3 MB of 10 MB"))
+        proc, last = summarise(None, {"proxy_bytes": 10_200_000, "proxy_budget_exceeded": True, "finished_at": "3"})
+        check("canary summary: budget exceeded -> red with the ::error:: line",
+              proc.returncode == 1 and "::error::stopped: proxy budget 10 MB exceeded" in proc.stdout
+              and last == "**live**: proxy traffic 10.2 MB of 10 MB", proc.stdout)
+        proc, last = summarise()
+        check("canary summary: no sidecar is reported, not a crash", proc.returncode == 0 and "not recorded" in last)
+        proc, last = summarise({"proxy_bytes": None, "proxy_budget_exceeded": False})
+        check("canary summary: over CDP (no local proxy) it says so", proc.returncode == 0 and "no local proxy" in last)
 
 
 def main():

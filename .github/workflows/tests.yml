@@ -206,6 +206,17 @@ jobs:
       - name: The ${{ matrix.engine }} CLI answers --help
         run: .venv/bin/python ${{ matrix.engine }}_scraper.py --help >/dev/null
 
+      # The proxy meter against a stub proxy in a real browser (Playwright's
+      # own Chromium; pyppeteer and Selenium use the runner's Chrome). A
+      # missing browser fails this step instead of skipping.
+      - name: Install Chromium for the proxy-meter test (Playwright only)
+        if: matrix.engine == 'playwright'
+        run: .venv/bin/python -m playwright install --with-deps chromium
+      - name: Proxy meter against a stub proxy, in a real ${{ matrix.engine }} browser
+        run: |
+          PROXY_METER_REQUIRE=${{ matrix.engine == 'puppeteer' && 'pyppeteer' || matrix.engine }} \
+            .venv/bin/python -m unittest -v tests.test_proxy_meter
+
   # The Dockerfile ships a runnable image, and smoke_test.py's own
   # test_dockerfile_copies_what_it_runs checks its COPY list against the
   # entrypoint's import graph without needing Docker — but it cannot catch
@@ -268,7 +279,7 @@ jobs:
           mods = ['browser_bridge','captcha_solver','catalog_walk','diff_runs',
                   'env_config','fingerprint_client','http_scraper',
                   'output_writer','page_flow','playwright_scraper',
-                  'product_parser','proxy_pool','scraper_api_client']
+                  'product_parser','proxy_pool','proxy_meter','scraper_api_client']
           bad = []
           for m in mods:
               try:

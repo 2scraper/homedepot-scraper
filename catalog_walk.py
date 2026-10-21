@@ -115,11 +115,18 @@ def walk(fetch, index_url: str, *, kind: str = "categories",
                 return
 
 
+class BudgetExceeded(RuntimeError):
+    """--proxy-budget-mb is spent: no further sitemap file is fetched."""
+
+
 def _http_fetch(proxy: Optional[str], timeout: int):
     import http_scraper
     session = http_scraper.build_session(proxy)
 
     def fetch(url: str) -> str:
+        import proxy_meter
+        if proxy_meter.exceeded():
+            raise BudgetExceeded(proxy_meter.STOP_REASON)
         result = http_scraper.fetch(session, url, timeout, retries=2)
         if result.error:
             raise RuntimeError("could not fetch %s: %s" % (url, result.error))
@@ -146,12 +153,15 @@ def main(argv=None) -> int:
     parser.add_argument("--proxy-shuffle", action="store_true")
     parser.add_argument("--proxy-sessions", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
+    import proxy_meter
+    proxy_meter.add_budget_argument(parser)
     args = parser.parse_args(argv)
 
     import env_config
     import proxy_pool
     env_config.apply(args)
     pool = proxy_pool.from_args(args)
+    proxy_meter.start(args.proxy_budget_mb, active=bool(pool))
     if not pool:
         print("WARNING: no proxy configured. The sitemaps answered from a "
               "non-US address during recon, but the pages they point at did "
@@ -162,11 +172,15 @@ def main(argv=None) -> int:
     index = CATEGORY_INDEX if args.kind == "categories" else PRODUCT_INDEX
 
     found = []
+    found_rc = None
     try:
         for url in walk(fetch, index, kind=args.kind, limit=args.limit,
                         core_only=not args.all_category_files,
                         grep=args.grep, log=log):
             found.append(url)
+    except BudgetExceeded:
+        # The URLs found so far are kept: 6 with some, 5 with none.
+        found_rc = 6 if found else 5
     except RuntimeError as exc:
         import http_scraper
         if isinstance(exc, http_scraper.ProxyAuthError):
@@ -184,6 +198,11 @@ def main(argv=None) -> int:
     else:
         for url in found:
             print(url)
+    proxy_meter.report()
+    if found_rc is not None:
+        print("[!] stopped: the proxy budget (--proxy-budget-mb) is spent; %d target(s) found so far."
+              % len(found), file=sys.stderr)
+        return found_rc
     return 0 if found else 4
 
 

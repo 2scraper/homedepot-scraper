@@ -70,16 +70,23 @@ jobs:
           if [ "$HAS_PROXY" = "true" ]; then
             unset HOMEDEPOT_CDP_ENDPOINT
             python3 http_scraper.py --url "$CANARY_URL" \
-              --pages 3 --out canary --format both --verbose
+              --pages 3 --out canary --format both --verbose --proxy-budget-mb 10
           else
             unset HOMEDEPOT_PROXY
             python3 playwright_scraper.py --url "$CANARY_URL" \
-              --pages 3 --out canary --format both --verbose
+              --pages 3 --out canary --format both --verbose --proxy-budget-mb 10
           fi
           rc=$?
           set -e
           echo "rc=$rc" >> "$GITHUB_ENV"
           echo "scraper exit code: $rc"
+
+      # What the run sent through HOMEDEPOT_PROXY, read from its sidecar; red
+      # when it stopped at the 10 MB budget (stop_reason proxy_budget_exceeded).
+      # Over CDP no local proxy is metered and the line says so.
+      - name: Proxy traffic
+        if: always()
+        run: python3 .github/proxy_traffic_summary.py canary live 10
 
       - name: Assert the exit code and the data
         run: |

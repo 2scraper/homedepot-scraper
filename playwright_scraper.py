@@ -22,6 +22,7 @@ import sys
 
 import browser_bridge
 import captcha_solver
+import proxy_meter
 import proxy_pool
 
 # Imported at MODULE level on purpose: the offline suite must be able to skip
@@ -83,6 +84,11 @@ class PlaywrightDriver:
                 # no parser reads them (image URLs come from the page data).
                 self._context.route("**/*", proxy_pool.playwright_media_route)
                 self.media_blocked = True
+            if pool:
+                # Counted for --proxy-budget-mb; registered after the media
+                # route, so it is asked first and aborts everything once the
+                # budget is spent.
+                proxy_meter.current().attach_playwright(self._context)
         self._page = self._context.new_page()
         self._page.set_default_timeout(self.args.timeout * 1000)
         if self._over_cdp:

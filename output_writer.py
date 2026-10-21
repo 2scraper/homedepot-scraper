@@ -38,6 +38,8 @@ from dataclasses import dataclass, asdict, field, fields
 from datetime import datetime, timezone
 from typing import Optional, List, Set, Sequence, Any, Tuple, Type
 
+import proxy_meter
+
 
 # One country, one hostname. Home Depot's US storefront is www.homedepot.com
 # with no locale prefix and no ccTLD family: homedepot.ca and homedepot.com.mx
@@ -362,6 +364,8 @@ def write_failed_attempt(out_prefix: str, *, stop_reason: str, mode: str,
     meta.update(run_id=uuid.uuid4().hex[:12], blocked=False,
                 csv_cells_escaped=None, transport_error=transport_error,
                 data_updated=False)
+    meta.update(proxy_meter.sidecar())  # proxy_bytes / proxy_budget_bytes / proxy_budget_exceeded
+    proxy_meter.report()
     if extra:
         meta["transport_facts"] = extra
     return write_attempt_meta(out_prefix, meta)
@@ -493,6 +497,10 @@ def finish_run(rows: Sequence[Any], out_prefix: str, fmt: str,
         no rows, any other reason           5  the content was never obtained
     """
     import uuid
+    if proxy_meter.exceeded():
+        # The run stopped itself at --proxy-budget-mb: rows kept -> 6, none
+        # -> 5, whatever else the pages it did fetch said.
+        stop_reason, blocked = proxy_meter.STOP_REASON, False
     complete = stop_reason in COMPLETE_STOP_REASONS
     row_cls = ROW_CLASS_BY_MODE.get(mode, Product)
     run_id = uuid.uuid4().hex[:12]
@@ -511,6 +519,7 @@ def finish_run(rows: Sequence[Any], out_prefix: str, fmt: str,
     # Declared rather than discovered: the CSV and the JSON differ in exactly
     # this many cells (see FORMULA_PREFIXES).
     base["csv_cells_escaped"] = escaped
+    base.update(proxy_meter.sidecar())
     if extra:
         base["transport_facts"] = extra
 
@@ -521,6 +530,7 @@ def finish_run(rows: Sequence[Any], out_prefix: str, fmt: str,
 
     # The attempt sidecar: ALWAYS. See write_attempt_meta.
     write_attempt_meta(out_prefix, dict(base, data_updated=bool(wrote_output)))
+    proxy_meter.report()
 
     if not rows:
         if blocked:
