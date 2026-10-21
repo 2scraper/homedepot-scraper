@@ -27,10 +27,24 @@ def _load(path):
         return None
 
 
+def _finished_at(meta):
+    """`finished_at` as a number: epoch seconds or an ISO-8601 string."""
+    value = meta.get("finished_at")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def summarise(out, label, budget_mb=10.0):
     """Return (line, whether the run stopped at its proxy budget)."""
     metas = [m for m in (_load(out + ".meta.json"), _load(out + ".latest_attempt.meta.json")) if m]
-    meta = max(metas, key=lambda m: m.get("finished_at") or 0) if metas else None
+    meta = max(metas, key=_finished_at) if metas else None
     budget = "%g MB" % budget_mb if budget_mb else "no"
     if meta is None:
         line = "**%s**: proxy traffic not recorded (no sidecar for %s)" % (label, out)

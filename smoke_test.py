@@ -2829,6 +2829,18 @@ def test_canary_reports_proxy_traffic():
         check("canary summary: budget exceeded -> red with the ::error:: line",
               proc.returncode == 1 and "::error::stopped: proxy budget 10 MB exceeded" in proc.stdout
               and last == "**live**: proxy traffic 10.2 MB of 10 MB", proc.stdout)
+        # This repo writes ISO-8601 finished_at: the newer sidecar wins, and a
+        # sidecar without one is ordered, not a TypeError.
+        proc, last = summarise({"proxy_bytes": 1, "proxy_budget_exceeded": False,
+                                "finished_at": "2026-10-21T08:00:00+00:00"},
+                               {"proxy_bytes": 10_200_000, "proxy_budget_exceeded": True,
+                                "finished_at": "2026-10-21T09:00:00+00:00"})
+        check("canary summary: ISO finished_at -> the newer sidecar is the run's", proc.returncode == 1, proc.stderr)
+        proc, last = summarise({"proxy_bytes": 1, "proxy_budget_exceeded": False},
+                               {"proxy_bytes": 2_000_000, "proxy_budget_exceeded": False,
+                                "finished_at": "2026-10-21T09:00:00Z"})
+        check("canary summary: a missing finished_at beside an ISO one does not crash",
+              proc.returncode == 0 and last == "**%s**: proxy traffic 2.0 MB of 10 MB" % 'live', (proc.stderr, last))
         proc, last = summarise()
         check("canary summary: no sidecar is reported, not a crash", proc.returncode == 0 and "not recorded" in last)
         proc, last = summarise({"proxy_bytes": None, "proxy_budget_exceeded": False})
