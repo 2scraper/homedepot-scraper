@@ -58,6 +58,7 @@ import env_config
 import output_writer
 import page_flow
 import product_parser as P
+import proxy_meter
 import proxy_pool
 from output_writer import Product, finish_run
 
@@ -141,7 +142,11 @@ class CurlSession:
             "--http2",
             "--compressed",
             "--max-time", str(timeout),
-            "--write-out", "\n%{http_code} %{url_effective}",
+            # The four sizes feed --proxy-budget-mb: request headers, request
+            # body, every response header block (CONNECT and redirects too),
+            # and the body as downloaded (compressed).
+            "--write-out", "\n%{http_code} %{size_request} %{size_upload} "
+                           "%{size_header} %{size_download} %{url_effective}",
             "--config", "-",
         ]
         if allow_redirects:
@@ -156,6 +161,11 @@ class CurlSession:
         except subprocess.TimeoutExpired:
             raise CurlError("curl timed out after %ds" % (timeout + 15)) from None
         if completed.returncode != 0:
+            # curl still prints --write-out on a failure (a refused CONNECT,
+            # a timeout): what it did exchange counts too.
+            failed_sizes = completed.stdout.rpartition("\n")[2].split(" ")[1:5]
+            if self.proxy and len(failed_sizes) == 4 and all(n.isdigit() for n in failed_sizes):
+                proxy_meter.current().add(sum(int(n) for n in failed_sizes))
             message = _mask_text(completed.stderr.strip()[:300])
             # curl 56 with a 407, or an explicit auth complaint, is the PROXY
             # refusing us — not the site. See ProxyAuthError.
@@ -169,13 +179,16 @@ class CurlSession:
         head = trailer.strip()[:3]
         if head == "407" or (head == "402" and self.proxy):
             raise ProxyAuthError(status=int(head))
-        parts = trailer.split(" ", 1)
+        parts = trailer.split(" ", 5)
         try:
             status = int(parts[0])
+            sizes = [int(n) for n in parts[1:5]]
         except (ValueError, IndexError):
             raise CurlError("could not read curl's status line: %r"
                             % trailer[:120]) from None
-        final_url = parts[1] if len(parts) > 1 else url
+        if self.proxy:
+            proxy_meter.current().add(sum(sizes))
+        final_url = parts[5] if len(parts) > 5 else url
         return _CurlResponse(status, body, final_url)
 
 
@@ -279,6 +292,9 @@ def build_session(proxy: Optional[str], client: Optional[str] = None):
     session.headers.update(BROWSER_HEADERS)
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
+        # Every response through the proxy counts toward --proxy-budget-mb.
+        session.hooks["response"].append(
+            lambda response, *a, **k: proxy_meter.current().requests_hook(response))
     return session
 
 
@@ -311,6 +327,10 @@ def fetch(session, url: str, timeout: int, *, retries: int = 2,
     attempts = max(1, retries + 1)
     exit_label = None
     for attempt in range(1, attempts + 1):
+        if proxy_meter.exceeded():
+            # --proxy-budget-mb: no further request through the proxy.
+            return last or FetchResult(url, error=proxy_meter.STOP_REASON, attempts=attempt - 1,
+                                       exit_used=exit_label)
         try:
             response = session.get(url, timeout=timeout, allow_redirects=True)
         except ProxyAuthError as exc:
@@ -374,6 +394,7 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
     """Returns `(rows, run_facts)`. Never writes anything."""
     pool = proxy_pool.from_args(args)
     proxy = pool.current if pool else None
+    proxy_meter.start(getattr(args, "proxy_budget_mb", proxy_meter.DEFAULT_BUDGET_MB), active=bool(proxy))
     if not proxy:
         print("WARNING: no proxy configured. Measured 2026-09-22, every URL on "
               "www.homedepot.com answered HTTP 403 from a non-US address — "
@@ -458,6 +479,10 @@ def scrape(args) -> Tuple[List[Product], Dict[str, Any]]:
         return rows, facts
 
     for page in range(1, args.pages + 1):
+        if proxy_meter.exceeded():
+            # --proxy-budget-mb: no further page through the proxy.
+            facts["stop_reason"] = proxy_meter.STOP_REASON
+            break
         page_target = P.page_url(url, page)
         log("page %d: %s" % (page, page_target))
         result = get(page_target, page)
@@ -540,6 +565,9 @@ def _transport_failed(result: "FetchResult", facts: Dict[str, Any],
     or as partial (6) when earlier pages already gave rows."""
     if result.status is not None or not result.error:
         return False
+    if result.error == proxy_meter.STOP_REASON:
+        facts["stop_reason"] = proxy_meter.STOP_REASON  # not a site failure
+        return True
     print("page %d: no answer from the site after %d attempt(s): %s"
           % (page, result.attempts, result.error), file=sys.stderr)
     facts["transport_error"] = result.error
@@ -621,6 +649,7 @@ def parse_args(argv=None):
     p.add_argument("--proxy-block-retries", type=_non_negative_int, default=3,
                    help="How many times a refused or challenged page may move "
                         "to a different exit before the run gives up.")
+    proxy_meter.add_budget_argument(p)
     args = p.parse_args(argv)
     # What the user TYPED wins over .env. env_config.apply fills only unset
     # values, so after it runs a HOMEDEPOT_URL from .env would sit in

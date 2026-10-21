@@ -48,6 +48,7 @@ import env_config
 import output_writer
 import page_flow
 import product_parser as P
+import proxy_meter
 import proxy_pool
 from output_writer import Product, finish_run
 
@@ -403,6 +404,9 @@ def run(args, driver) -> int:
     rows: List[Product] = []
     seen: set = set()
 
+    # Metered only for a LOCAL browser behind a proxy (never over CDP).
+    proxy_meter.start(getattr(args, "proxy_budget_mb", proxy_meter.DEFAULT_BUDGET_MB),
+                      active=bool(not getattr(args, "cdp_endpoint", None) and proxy_pool.from_args(args)))
     if not getattr(args, "cdp_endpoint", None):
         pool = proxy_pool.from_args(args)
         if pool:
@@ -459,6 +463,10 @@ def run(args, driver) -> int:
                     stop_reason = "parser_found_nothing"
         else:
             for page in range(1, args.pages + 1):
+                if proxy_meter.exceeded():
+                    # --proxy-budget-mb: no further page through the proxy.
+                    stop_reason = proxy_meter.STOP_REASON
+                    break
                 target = P.page_url(url, page)
                 log("page %d: %s" % (page, target))
                 result = fetch_page(driver, args, target, log=log)
@@ -658,6 +666,7 @@ def build_parser(description: str):
                         "--proxy-file (no parser reads them, and the proxy bills "
                         "per byte); never blocked with --cdp-endpoint or no proxy.")
     p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
+    proxy_meter.add_budget_argument(p)
     p.add_argument("--twocaptcha-key", default=None,
                    help="Prefer TWOCAPTCHA_KEY in .env — `ps` reads argv.")
     p.add_argument("--captcha-api", choices=["v2", "v1"], default="v2")

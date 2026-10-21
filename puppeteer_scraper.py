@@ -21,6 +21,7 @@ import sys
 
 import browser_bridge
 import captcha_solver
+import proxy_meter
 import proxy_pool
 
 # Module level — see selenium_scraper.py.
@@ -69,6 +70,8 @@ class PuppeteerDriver:
             if proxy_pool.should_block_media(self.args, proxy_in_use=bool(pool)):
                 self._run(proxy_pool.pyppeteer_block_media(self._page))
                 self.media_blocked = True
+            if pool:
+                self._run(proxy_meter.current().attach_pyppeteer(self._page))  # --proxy-budget-mb
         if self._page is None:
             self._page = self._run(self._browser.newPage())
 

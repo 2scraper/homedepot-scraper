@@ -27,6 +27,7 @@ import sys
 
 import browser_bridge
 import captcha_solver
+import proxy_meter
 import proxy_pool
 
 # Module level, so the offline suite can tell "engine absent" from "engine
@@ -74,7 +75,11 @@ class SeleniumDriver:
                       "through the driver's own fields." % bare,
                       file=sys.stderr)
             options.add_argument("--proxy-server=%s" % bare)
+            # The meter reads Chrome's performance log (--proxy-budget-mb).
+            proxy_meter.selenium_logging_prefs(options)
         self._driver = webdriver.Chrome(options=options)
+        if pool:
+            proxy_meter.current().attach_selenium(self._driver, keep_entries=False)
         self._driver.set_page_load_timeout(self.args.timeout)
         if proxy_pool.should_block_media(self.args, proxy_in_use=bool(pool)):
             # By URL pattern (Selenium has no request events): an image
@@ -84,12 +89,14 @@ class SeleniumDriver:
 
     def navigate(self, url):
         self._driver.get(url)
+        proxy_meter.current().poll_selenium(self._driver)
         # Selenium exposes no response object, so there is no status to
         # return. The classifier is built to stay correct without one — the
         # markers and the asset-host count carry it (product_parser).
         return None
 
     def content(self):
+        proxy_meter.current().poll_selenium(self._driver)  # the waits re-read the page
         try:
             return self._driver.page_source
         except Exception:
@@ -125,6 +132,7 @@ class SeleniumDriver:
 
     def stop(self):
         if self._driver is not None:
+            proxy_meter.current().poll_selenium(self._driver)  # what the last page still loaded
             try:
                 self._driver.quit()
             except Exception:

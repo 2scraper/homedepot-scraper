@@ -388,6 +388,36 @@ touching it and wait.
   page and its script and none of its images, video or font with blocking on,
   and all of them without it.
 
+### A traffic budget behind a proxy
+
+Every transport counts what it sends through a LOCAL proxy (`--proxy` /
+`--proxy-file` / `HOMEDEPOT_PROXY`), and `--proxy-budget-mb` (default `10`;
+`0` = unlimited) caps a run. Once the running total passes it, no further page
+(or retry, or sitemap file) is requested, a browser aborts any request it
+still tries, the rows already read are kept, and the run ends with
+`stop_reason: proxy_budget_exceeded`: exit `6` with rows, `5` without. It
+never goes on silently. A proxied run ends with one line such as `Proxy
+traffic: 3.2 MB of 10 MB budget`, and both sidecars record `proxy_bytes`,
+`proxy_budget_bytes` and `proxy_budget_exceeded` (`null` / `null` / `false`
+when no local proxy was used). Nothing is metered or limited over
+`--cdp-endpoint` or with no proxy. `catalog_walk.py` honours the same flag and
+prints the same line; it writes no sidecar.
+
+| Transport | Counted from |
+|---|---|
+| `http_scraper.py`, curl | curl's own `size_request` + `size_upload` + `size_header` + `size_download` (`--write-out`), also when curl fails |
+| `http_scraper.py` / `catalog_walk.py`, requests | request line, headers and body sent; status line, headers and body as received on the wire (compressed) |
+| Playwright | `request.sizes()` of every finished or failed request |
+| pyppeteer | CDP `Network.loadingFinished.encodedDataLength` of every response that came over the network, plus each request's line, headers and body |
+| Selenium | the same CDP events, from Chrome's performance log |
+| the browser pre-check | its `HEAD` response, as for requests |
+
+The count is an estimate of the tunnelled payload, not the proxy's invoice:
+TLS records, the `CONNECT` exchange (except the response headers curl
+reports), WebSocket frames and Chrome's own background requests are not
+visible to it, so the bill is a few per cent higher. A `CONNECT` that
+`requests` sees refused carries no response to count. 1 MB = 1,000,000 bytes.
+
 ---
 
 ## Exit codes
@@ -400,7 +430,7 @@ touching it and wait.
 | `3` | Blocked — the site refused this scraper |
 | `4` | Zero products — including a hub category, which is a correct answer |
 | `5` | The content was never obtained — **our** plumbing, not the site |
-| `6` | Partial — some pages fetched, then stopped early |
+| `6` | Partial — some pages fetched, then stopped early (including `stop_reason: proxy_budget_exceeded`) |
 
 **`3` and `5` mean different things and the difference matters.** `5` covers a
 navigation timeout, a dropped connection or CDP socket, an empty document from
@@ -409,7 +439,8 @@ credential that no longer authenticates or a proxy whose traffic balance is
 exhausted (HTTP 407 or 402 from the gateway — homedepot.com is never reached
 at all; `stop_reason: proxy_auth_failed`), a failed Scraper API call, and a page
 that lists products but parsed to none (a parser failure, not an empty
-category). Reporting any of those as `3` sends you to the anti-bot problem
+category), and a run whose proxy budget (`--proxy-budget-mb`) ran out before
+any row (`stop_reason: proxy_budget_exceeded`). Reporting any of those as `3` sends you to the anti-bot problem
 when the answer is somewhere else entirely. If one of them happens AFTER some
 pages already gave rows, the rows are written and the run exits `6`.
 
