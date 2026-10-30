@@ -1,4 +1,6 @@
-# homedepot-scraper
+# Home Depot Scraper — Per-Store Prices, Stock and Ratings in Python
+
+**Home Depot scraper** — an open-source (MIT) Python tool that reads homedepot.com category listings and product pages and writes per-store prices, stock, brand, model, ratings and the site's category hierarchy to JSON or CSV. Measured on 2026-09-22, it needs a US residential exit — from a non-US address every URL answered 403 — and through that exit `curl` with browser headers got HTTP 200 on 9 of 10 trials while a local Playwright Chromium was refused. Use it to monitor one store's prices and stock, or compare two complete runs with `diff_runs.py`.
 
 Scrapes Home Depot category listings and product pages — prices, stock, brand,
 model, ratings and the site's own category hierarchy. JSON or CSV, one row
@@ -545,6 +547,23 @@ What the 2Captcha products buy:
   rather than better cover.
 
 ---
+
+## Guides
+
+- [How to run the 2scraper scrapers: setup, proxies, exit codes and access modes](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers) — installation, `.env`, `.meta.json` for the whole family.
+
+## Related scrapers
+
+Same CLI conventions, same output contract (one row per item, JSON or CSV, a `.meta.json` sidecar and shared exit codes):
+
+- [Indiegogo scraper](https://github.com/2scraper/indiegogo-scraper) — Project listings, campaign pages and reward tiers
+- [Kohl's scraper](https://github.com/2scraper/kohls-scraper) — Prices, price ranges, sale and clearance labels, ratings…
+- [Maison KOSÉ scraper](https://github.com/2scraper/kose-scraper) — Kosé's Japanese online store (maison.kose.co.jp)
+- [LG scraper](https://github.com/2scraper/lg-scraper) — Every model in an lg.com category
+- [Lidl US scraper](https://github.com/2scraper/lidl-scraper) — Grocery prices, unit prices and pack sizes from lidl.com…
+- [MediaMarkt scraper](https://github.com/2scraper/mediamarkt-scraper) — Category grids, search results and product pages from ten…
+
+All scrapers: [github.com/2scraper](https://github.com/2scraper) · Need another site? [Open a request](https://github.com/2scraper/.github/issues/new?title=%5BScraper%20request%5D%20)
 
 ## Contributing, security, licence
 
