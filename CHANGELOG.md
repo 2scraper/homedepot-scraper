@@ -65,6 +65,7 @@ violation.
 
 ### Changed
 
+- CI only: the scheduled canary now starts at 04:47 UTC (Mondays) instead of 06:17, so canaries that share one Scraping Browser profile no longer start at the same time and lock each other out.
 - A proxy `402` (traffic/balance exhausted) is handled like a `407` in
   `http_scraper.py` and `catalog_walk.py`: exit 5, never retried or rotated.
   With `--http-client requests` a gateway `407`/`402` used to be retried as a
