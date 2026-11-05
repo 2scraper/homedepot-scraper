@@ -73,6 +73,10 @@ violation.
   `<out>.latest_attempt.meta.json` (`status: failed`,
   `stop_reason: proxy_auth_failed`), even with `--allow-empty`.
 
+- CI only: on the proxy route the canary mints six session-pinned exits from
+  `HOMEDEPOT_PROXY` (`--proxy-sessions 6 --proxy-shuffle
+  --proxy-block-retries 5`). On one exit, a 403 to that address ended the run
+  at page 1 with nothing to rotate to (2026-11-05).
 - CI only: the canary bills a paid route (`HOMEDEPOT_PROXY` or
   `HOMEDEPOT_CDP_ENDPOINT`), so it now runs weekly (Mondays 06:17 UTC) instead of
   daily; a manual dispatch still runs it.
