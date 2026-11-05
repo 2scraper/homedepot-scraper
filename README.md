@@ -559,8 +559,8 @@ The suite passes with no engine library installed; absent engines report a
 skip, and CI fails on an *unexpected* skip. `tests.yml` also runs one venv per
 engine and builds the Docker image.
 
-The **canary** (`canary.yml`) is one real run a week (cron `17 6 * * 1`,
-Mondays 06:17 UTC; GitHub may start it later) or on manual dispatch: three
+The **canary** (`canary.yml`) is one real run a week (cron `47 4 * * 1`,
+Mondays 04:47 UTC; GitHub may start it later) or on manual dispatch: three
 pages of the Miter Saws category through `HOMEDEPOT_PROXY` (a US residential
 2Captcha proxy, `http_scraper.py` over six session-pinned exits with
 `--proxy-block-retries 5`, so one refused exit does not decide the run) or, without it, `HOMEDEPOT_CDP_ENDPOINT` (country-us,
