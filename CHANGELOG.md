@@ -34,6 +34,19 @@ violation.
 
 ### Added
 
+- `--fingerprint` on `playwright_scraper.py` (with `--fp-tags`, `--fp-country`,
+  `--fp-refresh`): fetches a profile from the 2Captcha Fingerprint API with
+  `TWOCAPTCHA_KEY` and applies it to the locally launched Chromium — user
+  agent with matching client hints, locale and `Accept-Language`, timezone,
+  screen, navigator values and WebGL strings. Read back from the page after
+  the first navigation and recorded under `transport_facts.fingerprint`.
+  Never applied over the Scraping Browser: a typed `--cdp-endpoint` with
+  `--fingerprint` exits 2, an endpoint from `.env` is ignored for that run, a
+  missing key exits 2, and a refusal by the Fingerprint API exits 5 before any
+  page is fetched. Selenium and pyppeteer refuse the flag (exit 2).
+- `fingerprint_client.py` reads the fields where a real `chromium` response
+  keeps them (user agent at `userAgent.userAgent`, WebGL strings in
+  `webgl.glParameters`) and builds the client-hint override.
 - `--load-media` on the browser engines; `transport_facts.media_blocked` in
   the sidecars.
 - Proxy traffic meter (`proxy_meter.py`) on every transport, active only

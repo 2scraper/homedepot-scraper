@@ -16,7 +16,12 @@ no longer behaves like its original is worse than no fixture**, so each one is
 checked against the state its full capture produces before it is committed.
 
 `blocked_access_denied.html`, `blocked_oops.html` and `challenge_akamai.html`
-are the three walls, near-verbatim. They are small and carry no product data.
+are the three walls, near-verbatim.
+
+`fingerprint_chromium.json` is a 2Captcha Fingerprint API response
+(`/fingerprint/random`, `format=chromium`, 2026-09-30), trimmed to the fields
+the engine reads (the dropped keys are listed inside). It shows where each
+applied value sits in a real response. They are small and carry no product data.
 
 ## Not verbatim
 

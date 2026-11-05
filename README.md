@@ -315,7 +315,8 @@ browser, and rotates exits when a page is refused.
 
 **Playwright is the primary browser engine**, and over `--cdp-endpoint` it is
 the transport measured to clear Akamai's interstitial every time. Selenium and
-pyppeteer exist for parity: same flags, same exit codes, same run metadata.
+pyppeteer exist for parity: same flags (except Playwright's `--fingerprint`,
+below), same exit codes, same run metadata.
 
 |  | HTTP | Playwright | pyppeteer | Selenium | `--cdp-endpoint` |
 |---|---|---|---|---|---|
@@ -420,6 +421,42 @@ reports), WebSocket frames and Chrome's own background requests are not
 visible to it, so the bill is a few per cent higher. A `CONNECT` that
 `requests` sees refused carries no response to count. 1 MB = 1,000,000 bytes.
 
+### A 2Captcha fingerprint on a local browser (Playwright)
+
+```bash
+python3 playwright_scraper.py --fingerprint --fp-country us \
+  --url https://www.homedepot.com/b/Tools-Power-Tools-Saws-Miter-Saws/N-5yc1vZc2d7
+```
+
+`--fingerprint` fetches one profile from the
+[2Captcha Fingerprint API](https://2captcha.com/fingerprints/api) with
+`TWOCAPTCHA_KEY` and applies it to the Chromium this scraper launches: user
+agent together with its client hints (`Sec-CH-UA*`, `navigator.userAgentData`),
+locale and `Accept-Language`, timezone, screen and window size, device scale
+factor, `navigator.platform` / `hardwareConcurrency` / `deviceMemory` and the
+WebGL vendor and renderer strings. After the first page the scraper reads
+these back from the live page and records them, with any mismatch, under
+`transport_facts.fingerprint` in the run metadata.
+
+* **Local browser only.** The Scraping Browser API brings its own
+  fingerprint, so a typed `--cdp-endpoint` with `--fingerprint` exits 2, and a
+  `HOMEDEPOT_CDP_ENDPOINT` from `.env` is ignored for that run (with a notice).
+  Selenium and pyppeteer do not implement `--fingerprint` and refuse it (exit 2).
+* **A separate subscription.** A key without a fingerprint plan is answered
+  `403 ERROR_FINGERPRINT_PLAN_REQUIRED`; the run then exits 5 before any page
+  is fetched.
+* `--fp-tags` takes ONE tag (default `Windows`). `--fp-country` should match
+  the proxy's exit (`us` here). The response is cached in
+  `~/.cache/2captcha-fingerprints/` per set of flags, so the same flags give
+  the same identity (and no new charge); `--fp-refresh` fetches a new one.
+* What it does not change: the browser engine underneath is still the
+  installed Chromium, which may be a different version from the one the
+  profile names, and WebGL output is the real GPU's. It does not give a local
+  browser access to this site: a local Chromium is the transport this README
+  measured as refused, and no access difference has been measured with and
+  without a fingerprint. Use it for a consistent identity, not as a way past
+  Akamai.
+
 ---
 
 ## Exit codes
@@ -480,6 +517,16 @@ IDENTICAL sku set with zero drift in any stable field, and those 24 rows
 matched `sample_output.json` — which was cut from the *curl* path — on all 24
 skus with zero field and zero price differences.
 
+**Fingerprint, 2026-11-05.** `playwright_scraper.py --fingerprint --fp-country
+us --pages 1 --max-products 20 --solve-captcha never`, local headless Chromium
+156, no proxy, the Miter Saws category. The profile was a real US response
+from the Fingerprint API (the test account had no fingerprint plan that day,
+so it came from the cache, not a fresh fetch). Read back from the page: the
+profile's Chrome 150 user agent, `userAgentData` brands and platform,
+`en-US`, `America/New_York`, `Win32`, 32 cores, 32 GB, 2560×1440, client hints
+set, no mismatch. The page itself was Akamai's 403 to a non-US address, exit
+3, as for any local browser without a US exit.
+
 Discovery, over plain HTTP: `PLP_CORE_TAX-0.xml` alone holds **5,304** leaf
 category URLs; the product sitemap index spans 96 files.
 
@@ -512,6 +559,14 @@ The suite passes with no engine library installed; absent engines report a
 skip, and CI fails on an *unexpected* skip. `tests.yml` also runs one venv per
 engine and builds the Docker image.
 
+The **canary** (`canary.yml`) is one real run a week (cron `17 6 * * 1`,
+Mondays 06:17 UTC; GitHub may start it later) or on manual dispatch: three
+pages of the Miter Saws category through `HOMEDEPOT_PROXY` (US residential,
+`http_scraper.py`) or, without it, `HOMEDEPOT_CDP_ENDPOINT` (country-us,
+Playwright over CDP). It is never skipped to green: with neither secret it
+fails and names them, and a refused proxy, a block, zero rows or a partial run
+is red too.
+
 ---
 
 ## Troubleshooting
@@ -542,9 +597,11 @@ What the 2Captcha products buy:
   product page. If one does, the browser engines buy at most one solve per
   page, and only for a reCAPTCHA they can inject the token into
   (reCAPTCHA Enterprise is not implemented here and is never paid for).
-* **Fingerprints** — `fingerprint_client.py`. Not needed over CDP, where the
-  remote browser brings its own and stacking a second creates a contradiction
-  rather than better cover.
+* **[Fingerprints](https://2captcha.com/fingerprints/api)** — `--fingerprint`
+  (Playwright, local browser), billed as a separate subscription on the same
+  key. Not used over CDP, where the remote browser brings its own and stacking
+  a second creates a contradiction rather than better cover. See
+  [the fingerprint section](#a-2captcha-fingerprint-on-a-local-browser-playwright).
 
 ---
 
